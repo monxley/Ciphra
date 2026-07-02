@@ -3,10 +3,11 @@
 use std::io::{BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 
-use ciphra_engine::{DataType, Engine, QueryResult, Value};
+use ciphra_engine::{DataType, Engine, KdfParams, QueryResult, Value};
 
 const DEFAULT_DATA_DIR: &str = "./ciphra-data";
 const PASSPHRASE_ENV: &str = "CIPHRA_PASSPHRASE";
+const NEW_PASSPHRASE_ENV: &str = "CIPHRA_NEW_PASSPHRASE";
 const DEV_PASSPHRASE: &str = "ciphra-dev-only";
 
 fn main() -> ExitCode {
@@ -22,6 +23,7 @@ fn main() -> ExitCode {
 fn run() -> Result<ExitCode, String> {
     let mut data_dir = DEFAULT_DATA_DIR.to_string();
     let mut execute: Vec<String> = Vec::new();
+    let mut rotate = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -32,6 +34,7 @@ fn run() -> Result<ExitCode, String> {
             "--execute" | "-e" => {
                 execute.push(args.next().ok_or("-e requires a SQL argument")?);
             }
+            "--rotate-passphrase" => rotate = true,
             "--help" | "-h" => {
                 print_usage();
                 return Ok(ExitCode::SUCCESS);
@@ -56,6 +59,22 @@ fn run() -> Result<ExitCode, String> {
 
     let mut engine = Engine::open(&data_dir, &passphrase).map_err(|e| e.to_string())?;
 
+    if rotate {
+        let new_passphrase = match std::env::var(NEW_PASSPHRASE_ENV) {
+            Ok(p) if !p.is_empty() => p,
+            _ => {
+                return Err(format!(
+                    "--rotate-passphrase requires {NEW_PASSPHRASE_ENV} to be set"
+                ));
+            }
+        };
+        engine
+            .rotate_to(&new_passphrase, KdfParams::recommended())
+            .map_err(|e| e.to_string())?;
+        println!("passphrase rotated; the database is re-encrypted under the new key");
+        return Ok(ExitCode::SUCCESS);
+    }
+
     if !execute.is_empty() {
         for sql in &execute {
             run_sql(&mut engine, sql)?;
@@ -77,11 +96,13 @@ USAGE:
 OPTIONS:
     -d, --data <DIR>     Data directory (default: {DEFAULT_DATA_DIR})
     -e, --execute <SQL>  Execute statements and exit (repeatable)
+    --rotate-passphrase  Re-encrypt the database under {NEW_PASSPHRASE_ENV}
     -h, --help           Show this help
     -V, --version        Show version
 
 ENVIRONMENT:
-    {PASSPHRASE_ENV}   Passphrase the master key is derived from
+    {PASSPHRASE_ENV}       Passphrase the master key is derived from
+    {NEW_PASSPHRASE_ENV}   New passphrase for --rotate-passphrase
 
 REPL COMMANDS:
     .tables              List tables

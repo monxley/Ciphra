@@ -16,7 +16,9 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-const WAL_FILE: &str = "ciphra.wal";
+/// Name of the write-ahead log inside a data directory. Public so the
+/// engine can swap complete databases atomically (key rotation).
+pub const WAL_FILE: &str = "ciphra.wal";
 const OP_PUT: u8 = 1;
 const OP_DELETE: u8 = 2;
 
