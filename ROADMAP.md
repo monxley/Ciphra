@@ -27,7 +27,8 @@ later.
       unified entry format with the PK index, opt-in equality leakage
 - [x] Argon2id as the default KDF (BLAKE2b + Argon2id from RFC
       7693/9106, RFC test vectors; PBKDF2 databases keep opening)
-- [ ] Key rotation: re-seal a table under a new master
+- [x] Key rotation: whole-database re-encryption under a new
+      passphrase/KDF with an atomic WAL swap (`--rotate-passphrase`)
 - [ ] `EXPLAIN`, basic statistics
 - [ ] Benchmarks vs SQLite (honest numbers, encryption cost included)
 

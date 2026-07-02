@@ -48,12 +48,26 @@ MasterKey  ── HKDF-SHA256("canary")                ──► canary key
 MasterKey  ── HMAC(HKDF("tag:table-name"), name)   ──► opaque table tag (16 bytes)
 ```
 
-- The salt and KDF parameters are stored in `ciphra.keyparams` (they
-  are not secret); an existing database always opens with the
-  parameters it was created with. The master key and everything below
-  it never touch disk. Argon2id defaults: 19 MiB, t=2, p=1 (OWASP).
+- The salt and KDF parameters are recorded as a plaintext entry inside
+  the WAL (they are not secret; tampering only yields BadPassphrase
+  because the canary stops decrypting). An existing database always
+  opens with the parameters it was created with; legacy sidecar
+  `ciphra.keyparams` files are migrated on open. Argon2id defaults:
+  19 MiB, t=2, p=1 (OWASP).
 - A sealed canary value is checked on open so a wrong passphrase fails
   fast and loudly, instead of surfacing as "corrupt data" later.
+
+### Key rotation
+
+`Engine::rotate_to` (CLI: `--rotate-passphrase`) re-encrypts the whole
+database under a new passphrase and KDF: everything derived from the
+master key changes — sealed values, table tags, index value tags — so
+the keyspace is rebuilt into a scratch WAL, which then replaces the
+live one with a single atomic rename. A crash before the rename leaves
+the old database untouched (the scratch directory is swept on the next
+open); a crash after it leaves the new database complete. Keeping the
+KDF parameters inside the WAL is what makes the database a single file
+and the swap atomic.
 
 ### Sealing
 

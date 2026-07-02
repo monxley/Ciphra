@@ -21,6 +21,7 @@
 //!
 //! ```text
 //! \x00canary                        -> sealed marker to detect a wrong passphrase
+//! \x00keyparams                     -> plaintext KDF parameters + salt (not secret)
 //! \x00catalog\x00<tag16>            -> sealed TableSchema (incl. the real name)
 //! \x00seq\x00<tag16>                -> sealed next row id (u64 LE)
 //! r\x00<tag16><id BE>               -> sealed row
@@ -45,7 +46,7 @@
 mod codec;
 
 use std::cmp::Ordering;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use ciphra_sql::{ColumnDef, DataType};
 pub use codec::TableSchema;
@@ -56,7 +57,16 @@ use ciphra_sql::{
 };
 use ciphra_storage::{Storage, StorageError};
 
+/// Legacy sidecar file holding KDF parameters; still read (and migrated
+/// into the WAL) for databases created before the in-WAL record.
 const KEYPARAMS_FILE: &str = "ciphra.keyparams";
+/// Storage key of the (plaintext) KDF parameters record. Not secret —
+/// it must be readable before any key exists; tampering with it only
+/// yields BadPassphrase, since the canary no longer decrypts.
+const KEYPARAMS_KEY: &[u8] = b"\x00keyparams";
+/// Scratch directory used while rebuilding the database during key
+/// rotation; safe to delete whenever no rotation is running.
+const ROTATE_TMP_DIR: &str = ".rotate-tmp";
 /// v1 layout: `magic | iterations u32 LE | salt` (PBKDF2 implied).
 const KEYPARAMS_MAGIC_V1: &[u8; 8] = b"CIPHRA\x00\x01";
 /// v2 layout: `magic | kdf u8 | params | salt` where kdf 1 = PBKDF2
@@ -211,14 +221,15 @@ pub enum QueryResult {
 pub struct Engine {
     storage: Storage,
     master: MasterKey,
+    dir: PathBuf,
 }
 
 impl Engine {
     /// Open (or create) a database in `dir` with the recommended KDF
     /// ([`KdfParams::recommended`], Argon2id).
     ///
-    /// On first open a random salt and the KDF parameters are written
-    /// next to the data (they are not secret) and a sealed canary is
+    /// On first open a random salt and the KDF parameters are recorded
+    /// inside the WAL (they are not secret) and a sealed canary is
     /// stored; subsequent opens verify the canary and fail with
     /// [`EngineError::BadPassphrase`] on a mismatch.
     pub fn open(dir: impl AsRef<Path>, passphrase: &str) -> Result<Self> {
@@ -240,20 +251,36 @@ impl Engine {
     /// database being created. An existing database always uses the
     /// parameters recorded at creation time.
     pub fn open_with_kdf(dir: impl AsRef<Path>, passphrase: &str, kdf: KdfParams) -> Result<Self> {
-        let dir = dir.as_ref();
-        std::fs::create_dir_all(dir)?;
+        let dir = dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&dir)?;
 
+        // A leftover rotation directory means a rotation was interrupted
+        // before its atomic rename — the current WAL is still authoritative.
+        let leftover = dir.join(ROTATE_TMP_DIR);
+        if leftover.exists() {
+            let _ = std::fs::remove_dir_all(&leftover);
+        }
+
+        let mut storage = Storage::open(&dir)?;
+
+        // KDF parameters live inside the WAL, so the database is one
+        // file and rotation can swap it atomically. Databases created
+        // before this migrate from the legacy sidecar file on open.
         let params_path = dir.join(KEYPARAMS_FILE);
-        let (kdf, salt) = if params_path.exists() {
-            read_keyparams(&std::fs::read(&params_path)?)?
+        let recorded = storage.get(KEYPARAMS_KEY).map(<[u8]>::to_vec);
+        let (kdf, salt) = if let Some(record) = recorded {
+            read_keyparams(&record)?
+        } else if params_path.exists() {
+            let (kdf, salt) = read_keyparams(&std::fs::read(&params_path)?)?;
+            storage.put(KEYPARAMS_KEY, &encode_keyparams(kdf, &salt))?;
+            (kdf, salt)
         } else {
             let salt = ciphra_crypto::random_salt().to_vec();
-            std::fs::write(&params_path, encode_keyparams(kdf, &salt))?;
+            storage.put(KEYPARAMS_KEY, &encode_keyparams(kdf, &salt))?;
             (kdf, salt)
         };
 
         let master = kdf.derive(passphrase, &salt);
-        let mut storage = Storage::open(dir)?;
 
         let canary_key = master.derive_key("canary");
         match storage.get(CANARY_KEY) {
@@ -268,7 +295,76 @@ impl Engine {
             }
         }
 
-        Ok(Engine { storage, master })
+        Ok(Engine {
+            storage,
+            master,
+            dir,
+        })
+    }
+
+    /// Re-encrypt the whole database under a new passphrase (and KDF).
+    ///
+    /// Everything derived from the master key changes: sealed values,
+    /// table tags, index value tags — so the entire keyspace is rebuilt
+    /// into a scratch WAL, which then replaces the live one with a
+    /// single atomic rename. A crash before the rename leaves the old
+    /// database untouched (the scratch directory is cleaned up on the
+    /// next open); a crash after it leaves the new database complete.
+    pub fn rotate_to(&mut self, new_passphrase: &str, kdf: KdfParams) -> Result<()> {
+        // Snapshot everything through the current master key.
+        let mut snapshot = Vec::new();
+        for name in self.tables()? {
+            let schema = self.expect_schema(&name)?;
+            let table_key = self.table_key(&name);
+            let seq = self.load_seq(&name, &table_key)?;
+            let mut rows = Vec::new();
+            for (key, sealed) in self.storage.scan_prefix(&self.row_prefix(&name)) {
+                rows.push((
+                    rowid_from_key(key),
+                    codec::decode_row(&table_key.open(sealed, key)?)?,
+                ));
+            }
+            snapshot.push((schema, seq, rows));
+        }
+
+        // Rebuild into a scratch database under the new master.
+        let tmp = self.dir.join(ROTATE_TMP_DIR);
+        if tmp.exists() {
+            std::fs::remove_dir_all(&tmp)?;
+        }
+        let mut fresh = Engine::open_with_kdf(&tmp, new_passphrase, kdf)?;
+        for (schema, seq, rows) in snapshot {
+            fresh.store_schema(&schema)?;
+            let table_key = fresh.table_key(&schema.name);
+            fresh.store_seq(&schema.name, &table_key, seq)?;
+            let maintained = maintained_columns(&schema);
+            for (rowid, row) in rows {
+                let key = fresh.row_key(&schema.name, rowid);
+                let sealed = table_key.seal(&codec::encode_row(&row), &key);
+                fresh.storage.put(&key, &sealed)?;
+                for &col in &maintained {
+                    if row[col] != Value::Null {
+                        fresh.put_index_entry(&schema.name, &table_key, col, &row[col], rowid)?;
+                    }
+                }
+            }
+        }
+        drop(fresh);
+
+        // The atomic switch, then cleanup of everything now stale.
+        std::fs::rename(
+            tmp.join(ciphra_storage::WAL_FILE),
+            self.dir.join(ciphra_storage::WAL_FILE),
+        )?;
+        if let Ok(dir_handle) = std::fs::File::open(&self.dir) {
+            let _ = dir_handle.sync_all();
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_file(self.dir.join(KEYPARAMS_FILE));
+
+        // Reopen through the recorded (new) parameters.
+        *self = Engine::open(&self.dir, new_passphrase)?;
+        Ok(())
     }
 
     /// Parse and execute a string of `;`-separated SQL statements,
@@ -1619,6 +1715,86 @@ mod tests {
             .err()
             .expect("wrong passphrase must fail");
         assert!(matches!(err, EngineError::BadPassphrase), "got {err:?}");
+    }
+
+    #[test]
+    fn rotation_reencrypts_everything() {
+        let dir = ciphra_testutil::tempdir();
+        let secret = "ROTATE-ME-SECRET-424242";
+        let mut db = engine(dir.path());
+        db.execute(
+            "CREATE TABLE vault (id INT PRIMARY KEY, owner TEXT, secret TEXT ENCRYPTED); \
+             CREATE INDEX ON vault (owner);",
+        )
+        .unwrap();
+        db.execute(&format!(
+            "INSERT INTO vault VALUES (1, 'alice', '{secret}'), (2, 'bob', 'x'), \
+             (3, 'alice', 'y')"
+        ))
+        .unwrap();
+
+        db.rotate_to("brand-new-passphrase", KdfParams::Pbkdf2 { iterations: 3 })
+            .unwrap();
+
+        // The same handle keeps working after rotation...
+        let rows = rows_of(db.execute("SELECT secret FROM vault WHERE id = 1").unwrap());
+        assert_eq!(rows, vec![vec![text(secret)]]);
+        // ...including the secondary index and PK constraints.
+        let rows = rows_of(
+            db.execute("SELECT id FROM vault WHERE owner = 'alice'")
+                .unwrap(),
+        );
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(
+            db.execute("INSERT INTO vault VALUES (2, 'eve', 'z')"),
+            Err(EngineError::Constraint(_))
+        ));
+        db.execute("INSERT INTO vault VALUES (4, 'dave', 'w')")
+            .unwrap();
+        drop(db);
+
+        // Old passphrase is dead, new one opens; data intact on reopen.
+        let err = Engine::open(dir.path(), "test-passphrase")
+            .err()
+            .expect("old passphrase must be rejected after rotation");
+        assert!(matches!(err, EngineError::BadPassphrase), "got {err:?}");
+        let mut db = Engine::open(dir.path(), "brand-new-passphrase").unwrap();
+        assert_eq!(rows_of(db.execute("SELECT * FROM vault").unwrap()).len(), 4);
+
+        // Still zero plaintext on disk after the rebuild.
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                continue;
+            }
+            let bytes = std::fs::read(&path).unwrap();
+            for needle in ["alice", "vault", "owner", secret] {
+                assert!(
+                    !contains_subslice(&bytes, needle.as_bytes()),
+                    "plaintext {needle:?} leaked into {path:?} after rotation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn interrupted_rotation_leftovers_are_harmless() {
+        let dir = ciphra_testutil::tempdir();
+        {
+            let mut db = engine(dir.path());
+            db.execute("CREATE TABLE t (a INT); INSERT INTO t VALUES (1);")
+                .unwrap();
+        }
+        // Simulate a crash mid-rotation: a stale scratch directory with
+        // a half-built database in it.
+        let tmp = dir.path().join(".rotate-tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("ciphra.wal"), b"half-written garbage").unwrap();
+
+        // The old passphrase still opens the old data; leftovers are gone.
+        let mut db = engine(dir.path());
+        assert_eq!(rows_of(db.execute("SELECT * FROM t").unwrap()).len(), 1);
+        assert!(!tmp.exists());
     }
 
     #[test]

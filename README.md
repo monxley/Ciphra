@@ -72,6 +72,10 @@ rather than add-ons.
   Argon2id — is implemented in this repository and verified against
   official RFC/NIST test vectors. The supply chain is: the Rust
   standard library, and this repo.
+- **Key rotation**: `ciphra --rotate-passphrase` re-encrypts the whole
+  database under a new passphrase (new salt, new KDF, new table and
+  index tags) with an atomic file swap — a crash cannot strand the
+  database between two keys.
 - **CLI/REPL** with meta commands (`.tables`, `.schema`, `.help`).
 
 ## Quick start
@@ -105,8 +109,9 @@ deliberately does not yet.
 
 ## Roadmap (abridged)
 
-- **Phase 1** (in progress) — richer SQL ✅, encrypted table names ✅;
-  next: primary keys, secondary indexes, Argon2id KDF, key rotation.
+- **Phase 1** (nearly done) — richer SQL ✅, encrypted table names ✅,
+  primary keys ✅, secondary indexes ✅, Argon2id KDF ✅, key
+  rotation ✅; next: `EXPLAIN`, benchmarks vs SQLite.
 - **Phase 2** — queryable encryption (deterministic/order-revealing
   layers with an explicit leakage profile), Merkle-tree audit log,
   vector type + similarity search.
