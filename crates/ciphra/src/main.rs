@@ -188,6 +188,7 @@ fn meta_command(engine: &mut Engine, command: &str) -> bool {
     DELETE FROM t WHERE name = 'bob';
     CREATE INDEX ON t (name);
     CREATE RANGE INDEX ON t (id);
+    SELECT name FROM t ORDER BY embedding NEAREST TO [0.1, 0.9] LIMIT 5;
     DROP INDEX ON t (name);
     EXPLAIN SELECT * FROM t WHERE id = 2;
     DROP TABLE t;
@@ -231,8 +232,9 @@ All rows are ChaCha20-Poly1305 encrypted before they reach disk."
                 Ok(Some(schema)) => {
                     for col in &schema.columns {
                         let ty = match col.ty {
-                            DataType::Int => "INT",
-                            DataType::Text => "TEXT",
+                            DataType::Int => "INT".to_string(),
+                            DataType::Text => "TEXT".to_string(),
+                            DataType::Vector(dim) => format!("VECTOR({dim})"),
                         };
                         let pk = if col.primary_key { " PRIMARY KEY" } else { "" };
                         let enc = if col.encrypted { " ENCRYPTED" } else { "" };

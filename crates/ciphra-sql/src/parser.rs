@@ -92,9 +92,23 @@ impl Parser {
         let mut columns = Vec::new();
         loop {
             let col_name = self.identifier("column name")?;
-            let ty = match self.keyword("a column type (INT or TEXT)")?.as_str() {
+            let ty = match self
+                .keyword("a column type (INT, TEXT or VECTOR)")?
+                .as_str()
+            {
                 "int" | "integer" => DataType::Int,
                 "text" | "varchar" => DataType::Text,
+                "vector" => {
+                    self.expect(&Token::LParen)?;
+                    let dim = self.unsigned("a vector dimension")?;
+                    self.expect(&Token::RParen)?;
+                    if dim == 0 || dim > 4096 {
+                        return Err(ParseError(format!(
+                            "vector dimension must be 1..=4096, got {dim}"
+                        )));
+                    }
+                    DataType::Vector(dim as u16)
+                }
                 other => return Err(ParseError(format!("unknown column type: {other:?}"))),
             };
             let mut encrypted = false;
@@ -183,13 +197,34 @@ impl Parser {
         let order_by = if self.eat_keyword("order") {
             self.expect_keyword("by")?;
             let column = self.identifier("column name")?;
-            let descending = if self.eat_keyword("desc") {
-                true
+            if self.eat_keyword("nearest") {
+                self.expect_keyword("to")?;
+                let query = match self.literal()? {
+                    Literal::Vector(v) => v,
+                    other => {
+                        return Err(ParseError(format!(
+                            "NEAREST TO takes a vector literal, found {other}"
+                        )));
+                    }
+                };
+                Some(OrderBy {
+                    column,
+                    descending: false,
+                    nearest_to: Some(query),
+                })
             } else {
-                self.eat_keyword("asc");
-                false
-            };
-            Some(OrderBy { column, descending })
+                let descending = if self.eat_keyword("desc") {
+                    true
+                } else {
+                    self.eat_keyword("asc");
+                    false
+                };
+                Some(OrderBy {
+                    column,
+                    descending,
+                    nearest_to: None,
+                })
+            }
         } else {
             None
         };
@@ -312,6 +347,17 @@ impl Parser {
         match self.next("a literal")? {
             Token::Int(n) => Ok(Literal::Int(n)),
             Token::Str(s) => Ok(Literal::Text(s)),
+            Token::LBracket => {
+                let mut components = vec![self.vector_component()?];
+                while self.eat(&Token::Comma) {
+                    components.push(self.vector_component()?);
+                }
+                self.expect(&Token::RBracket)?;
+                Ok(Literal::Vector(components))
+            }
+            Token::Float(_) => Err(ParseError(
+                "float literals are only supported inside vectors".into(),
+            )),
             Token::Minus => match self.next("an integer")? {
                 Token::Int(n) => Ok(Literal::Int(-n)),
                 other => Err(ParseError(format!(
@@ -321,6 +367,21 @@ impl Parser {
             Token::Ident(kw) if kw == "null" => Ok(Literal::Null),
             other => Err(ParseError(format!("expected a literal, found {other}"))),
         }
+    }
+
+    /// One number inside a `[...]` vector literal.
+    fn vector_component(&mut self) -> Result<f32, ParseError> {
+        let negative = self.eat(&Token::Minus);
+        let magnitude = match self.next("a number")? {
+            Token::Int(n) => n as f32,
+            Token::Float(x) => x as f32,
+            other => {
+                return Err(ParseError(format!(
+                    "expected a number in a vector literal, found {other}"
+                )));
+            }
+        };
+        Ok(if negative { -magnitude } else { magnitude })
     }
 
     fn unsigned(&mut self, expected: &str) -> Result<u64, ParseError> {

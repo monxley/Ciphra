@@ -97,6 +97,8 @@ pub struct ColumnDef {
 pub enum DataType {
     Int,
     Text,
+    /// Fixed-dimension f32 embedding, e.g. `VECTOR(384)`.
+    Vector(u16),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -104,6 +106,8 @@ pub enum Literal {
     Null,
     Int(i64),
     Text(String),
+    /// `[0.1, -2.5, 3]` — components may be written as ints or floats.
+    Vector(Vec<f32>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -144,6 +148,16 @@ impl std::fmt::Display for Literal {
             Literal::Null => write!(f, "NULL"),
             Literal::Int(n) => write!(f, "{n}"),
             Literal::Text(s) => write!(f, "'{}'", s.replace('\'', "''")),
+            Literal::Vector(v) => {
+                write!(f, "[")?;
+                for (i, x) in v.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{x}")?;
+                }
+                write!(f, "]")
+            }
         }
     }
 }
@@ -166,6 +180,9 @@ impl std::fmt::Display for Expr {
 pub struct OrderBy {
     pub column: String,
     pub descending: bool,
+    /// `ORDER BY col NEAREST TO [..]`: sort by cosine distance to this
+    /// query vector, nearest first. Mutually exclusive with ASC/DESC.
+    pub nearest_to: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -425,7 +442,8 @@ mod tests {
                 predicate: None,
                 order_by: Some(OrderBy {
                     column: "id".into(),
-                    descending: true
+                    descending: true,
+                    nearest_to: None,
                 }),
                 limit: Some(Limit {
                     count: 10,
@@ -444,7 +462,8 @@ mod tests {
             order_by,
             Some(OrderBy {
                 column: "id".into(),
-                descending: false
+                descending: false,
+                nearest_to: None,
             })
         );
         assert_eq!(limit, None);
@@ -509,7 +528,8 @@ mod tests {
             order_by,
             Some(OrderBy {
                 column: "a".into(),
-                descending: true
+                descending: true,
+                nearest_to: None,
             })
         );
     }

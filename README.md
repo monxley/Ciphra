@@ -77,6 +77,10 @@ rather than add-ons.
   Argon2id — is implemented in this repository and verified against
   official RFC/NIST test vectors. The supply chain is: the Rust
   standard library, and this repo.
+- **Vector search over encrypted embeddings**: `VECTOR(dim)` columns
+  and `ORDER BY emb NEAREST TO [0.1, ...] LIMIT k` — exact cosine
+  similarity computed over sealed rows, so Ciphra doubles as an
+  encrypted vector store for RAG workloads.
 - **Tamper-evident audit chain**: every mutating statement appends a
   sealed hash-chain entry in the same atomic commit as its data.
   `.audit verify` re-checks all of history; publish `.audit root`

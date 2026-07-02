@@ -176,7 +176,8 @@ NOT protected against (yet — see ROADMAP):
 
 ## SQL engine (v0)
 
-Dialect: `CREATE TABLE` (INT/TEXT, `ENCRYPTED` column marker), `INSERT`
+Dialect: `CREATE TABLE` (INT/TEXT/VECTOR(dim), `ENCRYPTED` column
+marker), `INSERT`
 (multi-row, optional column list), `SELECT` (projection, compound
 `WHERE` with `AND`/`OR`/`NOT`/parentheses/`IS [NOT] NULL`, `ORDER BY
 ... ASC|DESC`, `LIMIT ... OFFSET`), `UPDATE ... SET`, `DELETE`,
@@ -185,6 +186,14 @@ with NULL are *unknown* and filter the row out, and Kleene rules apply
 through AND/OR/NOT. Execution is a straight scan-filter-sort-project
 over `scan_prefix` — no planner yet, by design: the planner earns its
 complexity only once secondary indexes exist.
+
+Vector columns hold fixed-dimension f32 embeddings written as
+`[0.1, -2, 0.5]` literals. They have no order: comparisons, plain
+`ORDER BY` and all index kinds are rejected with a pointed error;
+`ORDER BY col NEAREST TO [..] LIMIT k` runs an exact brute-force cosine
+scan over decrypted candidate rows (nearest first, NULLs last). Exact
+search over sealed rows adds no leakage beyond the query itself; a
+sealed ANN structure for large corpora is the planned upgrade.
 
 The `ENCRYPTED` marker is accepted and recorded in the schema today
 (all rows are sealed regardless); it reserves the syntax for per-column

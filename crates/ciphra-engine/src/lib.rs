@@ -160,6 +160,7 @@ pub enum Value {
     Null,
     Int(i64),
     Text(String),
+    Vector(Vec<f32>),
 }
 
 impl std::fmt::Display for Value {
@@ -168,6 +169,16 @@ impl std::fmt::Display for Value {
             Value::Null => write!(f, "NULL"),
             Value::Int(n) => write!(f, "{n}"),
             Value::Text(s) => write!(f, "{s}"),
+            Value::Vector(v) => {
+                write!(f, "[")?;
+                for (i, x) in v.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{x}")?;
+                }
+                write!(f, "]")
+            }
         }
     }
 }
@@ -690,11 +701,17 @@ impl Engine {
             steps.push(format!("filter: {predicate}"));
         }
         if let Some(ob) = order_by {
-            steps.push(format!(
-                "sort by {}{}",
-                ob.column,
-                if ob.descending { " DESC" } else { "" }
-            ));
+            match &ob.nearest_to {
+                Some(_) => steps.push(format!(
+                    "brute-force cosine scan: nearest to query vector on {}",
+                    ob.column
+                )),
+                None => steps.push(format!(
+                    "sort by {}{}",
+                    ob.column,
+                    if ob.descending { " DESC" } else { "" }
+                )),
+            }
         }
         if let Some(l) = limit {
             steps.push(format!("limit {} offset {}", l.count, l.offset));
@@ -725,6 +742,15 @@ impl Engine {
                 "table {name:?} declares more than one PRIMARY KEY column"
             )));
         }
+        if let Some(col) = columns
+            .iter()
+            .find(|c| c.primary_key && matches!(c.ty, DataType::Vector(_)))
+        {
+            return Err(EngineError::Schema(format!(
+                "vector column {:?} cannot be a PRIMARY KEY",
+                col.name
+            )));
+        }
         let schema = TableSchema {
             name: name.clone(),
             columns,
@@ -749,6 +775,11 @@ impl Engine {
         if schema.columns[col].indexed {
             return Err(EngineError::Schema(format!(
                 "column {column:?} of table {table:?} is already indexed"
+            )));
+        }
+        if matches!(schema.columns[col].ty, DataType::Vector(_)) {
+            return Err(EngineError::Schema(format!(
+                "vector column {column:?} cannot carry an equality index"
             )));
         }
         // Backfill entries for existing rows and flip the schema flag in
@@ -814,6 +845,11 @@ impl Engine {
         if schema.columns[col].range_indexed {
             return Err(EngineError::Schema(format!(
                 "column {column:?} of table {table:?} already has a range index"
+            )));
+        }
+        if matches!(schema.columns[col].ty, DataType::Vector(_)) {
+            return Err(EngineError::Schema(format!(
+                "vector column {column:?} has no order; a range index cannot serve it"
             )));
         }
         // Build the sorted blob from existing rows and persist it with
@@ -1029,10 +1065,42 @@ impl Engine {
 
         // Sort whole rows first so ORDER BY works on unprojected columns.
         if let (Some(index), Some(ob)) = (sort_index, &order_by) {
-            rows.sort_by(|a, b| {
-                let ord = compare_values(&a[index], &b[index]);
-                if ob.descending { ord.reverse() } else { ord }
-            });
+            let is_vector = matches!(schema.columns[index].ty, DataType::Vector(_));
+            match &ob.nearest_to {
+                Some(query) => {
+                    if !is_vector {
+                        return Err(EngineError::Type(format!(
+                            "NEAREST TO requires a VECTOR column; {:?} is not one",
+                            ob.column
+                        )));
+                    }
+                    // Brute-force cosine scan: exact, over decrypted rows.
+                    let mut keyed: Vec<(f32, Vec<Value>)> = rows
+                        .into_iter()
+                        .map(|row| {
+                            let distance = match &row[index] {
+                                Value::Vector(v) => cosine_distance(v, query),
+                                _ => f32::INFINITY, // NULLs sort last
+                            };
+                            (distance, row)
+                        })
+                        .collect();
+                    keyed.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    rows = keyed.into_iter().map(|(_, row)| row).collect();
+                }
+                None => {
+                    if is_vector {
+                        return Err(EngineError::Type(format!(
+                            "vector column {:?} has no order; use ORDER BY {} NEAREST TO [..]",
+                            ob.column, ob.column
+                        )));
+                    }
+                    rows.sort_by(|a, b| {
+                        let ord = compare_values(&a[index], &b[index]);
+                        if ob.descending { ord.reverse() } else { ord }
+                    });
+                }
+            }
         }
 
         let rows: Vec<Vec<Value>> = match limit {
@@ -1734,15 +1802,37 @@ fn coerce(literal: Literal, column: &ColumnDef) -> Result<Value> {
         (Literal::Null, _) => Ok(Value::Null),
         (Literal::Int(n), DataType::Int) => Ok(Value::Int(n)),
         (Literal::Text(s), DataType::Text) => Ok(Value::Text(s)),
-        (Literal::Int(_), DataType::Text) => Err(EngineError::Type(format!(
-            "column {:?} is TEXT, got an integer",
-            column.name
-        ))),
-        (Literal::Text(_), DataType::Int) => Err(EngineError::Type(format!(
-            "column {:?} is INT, got a string",
+        (Literal::Vector(v), DataType::Vector(dim)) => {
+            if v.len() != dim as usize {
+                return Err(EngineError::Type(format!(
+                    "column {:?} is VECTOR({dim}), got a {}-dimensional vector",
+                    column.name,
+                    v.len()
+                )));
+            }
+            Ok(Value::Vector(v))
+        }
+        (got, want) => Err(EngineError::Type(format!(
+            "column {:?} is {want:?}, got {got}",
             column.name
         ))),
     }
+}
+
+/// Cosine distance in [0, 2]; degenerate (zero-norm) inputs pin to 1.
+fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0.0f64;
+    let mut norm_a = 0.0f64;
+    let mut norm_b = 0.0f64;
+    for (x, y) in a.iter().zip(b) {
+        dot += f64::from(*x) * f64::from(*y);
+        norm_a += f64::from(*x) * f64::from(*x);
+        norm_b += f64::from(*y) * f64::from(*y);
+    }
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 1.0;
+    }
+    (1.0 - dot / (norm_a.sqrt() * norm_b.sqrt())) as f32
 }
 
 /// Total order for sorting within one (typed) column: NULLs sort first.
@@ -1753,9 +1843,18 @@ fn compare_values(a: &Value, b: &Value) -> Ordering {
         (_, Value::Null) => Ordering::Greater,
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        (Value::Vector(x), Value::Vector(y)) => {
+            // Deterministic but meaningless; user-visible comparisons on
+            // vector columns are rejected before reaching this.
+            let xb: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let yb: Vec<u8> = y.iter().flat_map(|v| v.to_le_bytes()).collect();
+            xb.cmp(&yb)
+        }
         // Unreachable with typed columns; defined for totality.
-        (Value::Int(_), Value::Text(_)) => Ordering::Less,
-        (Value::Text(_), Value::Int(_)) => Ordering::Greater,
+        (Value::Int(_), _) => Ordering::Less,
+        (_, Value::Int(_)) => Ordering::Greater,
+        (Value::Text(_), _) => Ordering::Less,
+        (_, Value::Text(_)) => Ordering::Greater,
     }
 }
 
@@ -1794,6 +1893,7 @@ fn compile_expr(schema: &TableSchema, expr: Expr) -> Result<CompiledExpr> {
                 Literal::Null => Value::Null,
                 Literal::Int(n) => Value::Int(n),
                 Literal::Text(s) => Value::Text(s),
+                Literal::Vector(v) => Value::Vector(v),
             },
         },
         Expr::IsNull { column, negated } => CompiledExpr::IsNull {
@@ -1834,6 +1934,12 @@ impl CompiledExpr {
                     (Value::Null, _) | (_, Value::Null) => return Ok(None),
                     (Value::Int(a), Value::Int(b)) => a.cmp(b),
                     (Value::Text(a), Value::Text(b)) => a.cmp(b),
+                    (Value::Vector(_), _) | (_, Value::Vector(_)) => {
+                        return Err(EngineError::Type(format!(
+                            "vector column {column_name:?} does not support comparisons; \
+                             use ORDER BY {column_name} NEAREST TO [..]"
+                        )));
+                    }
                     _ => {
                         return Err(EngineError::Type(format!(
                             "cannot compare column {column_name:?} with a value of a \
@@ -2338,6 +2444,115 @@ mod tests {
         assert_eq!(rows_of(db.execute("SELECT * FROM t").unwrap()).len(), 0);
         // EXPLAIN of unsupported statements is a parse error.
         assert!(db.execute("EXPLAIN CREATE TABLE u (a INT)").is_err());
+    }
+
+    #[test]
+    fn vector_similarity_search() {
+        let dir = ciphra_testutil::tempdir();
+        let mut db = engine(dir.path());
+        db.execute("CREATE TABLE docs (id INT PRIMARY KEY, title TEXT, emb VECTOR(3))")
+            .unwrap();
+        db.execute(
+            "INSERT INTO docs VALUES \
+             (1, 'east',  [1, 0, 0]), \
+             (2, 'north', [0, 1, 0]), \
+             (3, 'up',    [0, 0, 1]), \
+             (4, 'northeast', [0.7, 0.7, 0]), \
+             (5, 'unknown', NULL)",
+        )
+        .unwrap();
+
+        // Nearest-first by cosine distance; NULL embeddings sort last.
+        let rows = rows_of(
+            db.execute("SELECT title FROM docs ORDER BY emb NEAREST TO [1, 0.1, 0] LIMIT 3")
+                .unwrap(),
+        );
+        let titles: Vec<String> = rows.into_iter().map(|r| r[0].to_string()).collect();
+        assert_eq!(titles, vec!["east", "northeast", "north"]);
+
+        let rows = rows_of(
+            db.execute("SELECT title FROM docs ORDER BY emb NEAREST TO [0, 0, 1]")
+                .unwrap(),
+        );
+        assert_eq!(rows[0][0].to_string(), "up");
+        assert_eq!(rows.last().unwrap()[0].to_string(), "unknown");
+
+        // The filter still applies before the similarity sort.
+        let rows = rows_of(
+            db.execute(
+                "SELECT title FROM docs WHERE id > 1 ORDER BY emb NEAREST TO [1, 0, 0] LIMIT 1",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows[0][0].to_string(), "northeast");
+
+        // EXPLAIN names the path.
+        let plan = rows_of(
+            db.execute("EXPLAIN SELECT title FROM docs ORDER BY emb NEAREST TO [1, 0, 0]")
+                .unwrap(),
+        );
+        assert!(
+            plan.iter()
+                .any(|r| r[0].to_string().contains("brute-force cosine scan"))
+        );
+
+        // Survives reopen and rotation like everything else.
+        drop(db);
+        let mut db = engine(dir.path());
+        db.rotate_to("v-rotated", KdfParams::Pbkdf2 { iterations: 3 })
+            .unwrap();
+        let rows = rows_of(
+            db.execute("SELECT title FROM docs ORDER BY emb NEAREST TO [0, 1, 0] LIMIT 1")
+                .unwrap(),
+        );
+        assert_eq!(rows[0][0].to_string(), "north");
+    }
+
+    #[test]
+    fn vector_type_rules() {
+        let dir = ciphra_testutil::tempdir();
+        let mut db = engine(dir.path());
+        db.execute("CREATE TABLE d (id INT PRIMARY KEY, emb VECTOR(3))")
+            .unwrap();
+
+        // Dimension is enforced.
+        assert!(matches!(
+            db.execute("INSERT INTO d VALUES (1, [1, 2])"),
+            Err(EngineError::Type(_))
+        ));
+        // Wrong literal type.
+        assert!(matches!(
+            db.execute("INSERT INTO d VALUES (1, 'oops')"),
+            Err(EngineError::Type(_))
+        ));
+        db.execute("INSERT INTO d VALUES (1, [1, 2, 3])").unwrap();
+
+        // No comparisons, no plain ordering, no indexes on vectors.
+        assert!(matches!(
+            db.execute("SELECT * FROM d WHERE emb = [1, 2, 3]"),
+            Err(EngineError::Type(_))
+        ));
+        assert!(matches!(
+            db.execute("SELECT * FROM d ORDER BY emb"),
+            Err(EngineError::Type(_))
+        ));
+        assert!(matches!(
+            db.execute("CREATE INDEX ON d (emb)"),
+            Err(EngineError::Schema(_))
+        ));
+        assert!(matches!(
+            db.execute("CREATE RANGE INDEX ON d (emb)"),
+            Err(EngineError::Schema(_))
+        ));
+        assert!(matches!(
+            db.execute("CREATE TABLE bad (v VECTOR(2) PRIMARY KEY)"),
+            Err(EngineError::Schema(_))
+        ));
+        // NEAREST TO on a non-vector column is a type error.
+        assert!(matches!(
+            db.execute("SELECT * FROM d ORDER BY id NEAREST TO [1, 2, 3]"),
+            Err(EngineError::Type(_))
+        ));
     }
 
     #[test]
