@@ -70,6 +70,8 @@ const KEYPARAMS_KEY: &[u8] = b"\x00keyparams";
 /// Scratch directory used while rebuilding the database during key
 /// rotation; safe to delete whenever no rotation is running.
 const ROTATE_TMP_DIR: &str = ".rotate-tmp";
+/// Prefix of sealed range-index blobs: `z\x00<tag16><col u16 BE>`.
+const RANGE_PREFIX: &[u8] = b"z\x00";
 /// Prefix of sealed audit-chain entries: `a\x00<seq u64 BE>`.
 const AUDIT_PREFIX: &[u8] = b"a\x00";
 /// Storage key of the sealed audit head: `seq u64 LE | root (32)`.
@@ -278,10 +280,12 @@ pub enum QueryResult {
     IndexCreated {
         table: String,
         column: String,
+        range: bool,
     },
     IndexDropped {
         table: String,
         column: String,
+        range: bool,
     },
     Inserted(usize),
     Updated(usize),
@@ -482,9 +486,9 @@ impl Engine {
             let table_key = fresh.table_key(&schema.name);
             fresh.add_seq(&mut writes, &schema.name, &table_key, seq);
             let maintained = maintained_columns(&schema);
-            for (rowid, row) in rows {
-                let key = fresh.row_key(&schema.name, rowid);
-                let sealed = table_key.seal(&codec::encode_row(&row), &key);
+            for (rowid, row) in &rows {
+                let key = fresh.row_key(&schema.name, *rowid);
+                let sealed = table_key.seal(&codec::encode_row(row), &key);
                 writes.put(&key, &sealed);
                 for &col in &maintained {
                     if row[col] != Value::Null {
@@ -494,10 +498,19 @@ impl Engine {
                             &table_key,
                             col,
                             &row[col],
-                            rowid,
+                            *rowid,
                         );
                     }
                 }
+            }
+            for col in range_indexed_columns(&schema) {
+                let mut entries: Vec<(Value, u64)> = rows
+                    .iter()
+                    .filter(|(_, row)| row[col] != Value::Null)
+                    .map(|(rowid, row)| (row[col].clone(), *rowid))
+                    .collect();
+                sort_range_entries(&mut entries);
+                fresh.add_range_blob(&mut writes, &schema.name, &table_key, col, &entries);
             }
             fresh.storage.commit(writes)?;
         }
@@ -575,8 +588,26 @@ impl Engine {
         match statement {
             Statement::CreateTable { name, columns } => self.create_table(name, columns),
             Statement::DropTable { name } => self.drop_table(&name),
-            Statement::CreateIndex { table, column } => self.create_index(&table, &column),
-            Statement::DropIndex { table, column } => self.drop_index(&table, &column),
+            Statement::CreateIndex {
+                table,
+                column,
+                range: false,
+            } => self.create_index(&table, &column),
+            Statement::CreateIndex {
+                table,
+                column,
+                range: true,
+            } => self.create_range_index(&table, &column),
+            Statement::DropIndex {
+                table,
+                column,
+                range: false,
+            } => self.drop_index(&table, &column),
+            Statement::DropIndex {
+                table,
+                column,
+                range: true,
+            } => self.drop_range_index(&table, &column),
             Statement::Insert {
                 table,
                 columns,
@@ -644,7 +675,16 @@ impl Engine {
                     schema.name, schema.columns[col].name
                 ));
             }
-            None => steps.push(format!("{action}: full scan of {}", schema.name)),
+            None => match compiled
+                .as_ref()
+                .and_then(|f| range_indexed_pred(f, &schema))
+            {
+                Some((col, op, _)) => steps.push(format!(
+                    "{action}: sealed range-index scan on {}.{} ({op})",
+                    schema.name, schema.columns[col].name
+                )),
+                None => steps.push(format!("{action}: full scan of {}", schema.name)),
+            },
         }
         if let Some(predicate) = predicate {
             steps.push(format!("filter: {predicate}"));
@@ -734,6 +774,7 @@ impl Engine {
         Ok(QueryResult::IndexCreated {
             table: table.to_string(),
             column: column.to_string(),
+            range: false,
         })
     }
 
@@ -761,13 +802,73 @@ impl Engine {
         Ok(QueryResult::IndexDropped {
             table: table.to_string(),
             column: column.to_string(),
+            range: false,
+        })
+    }
+
+    fn create_range_index(&mut self, table: &str, column: &str) -> Result<QueryResult> {
+        let mut schema = self.expect_schema(table)?;
+        let col = schema.column_index(column).ok_or_else(|| {
+            EngineError::Schema(format!("unknown column {column:?} in table {table:?}"))
+        })?;
+        if schema.columns[col].range_indexed {
+            return Err(EngineError::Schema(format!(
+                "column {column:?} of table {table:?} already has a range index"
+            )));
+        }
+        // Build the sorted blob from existing rows and persist it with
+        // the schema flag in one committed batch.
+        let table_key = self.table_key(table);
+        let mut entries: Vec<(Value, u64)> = Vec::new();
+        for (key, sealed) in self.storage.scan_prefix(&self.row_prefix(table)) {
+            let row = codec::decode_row(&table_key.open(sealed, key)?)?;
+            if row[col] != Value::Null {
+                entries.push((row[col].clone(), rowid_from_key(key)));
+            }
+        }
+        sort_range_entries(&mut entries);
+        let mut batch = Batch::new();
+        self.add_range_blob(&mut batch, table, &table_key, col, &entries);
+        schema.columns[col].range_indexed = true;
+        self.add_schema(&mut batch, &schema);
+        self.commit_audited(audit_kind::CREATE_INDEX, self.table_tag(table), batch)?;
+        Ok(QueryResult::IndexCreated {
+            table: table.to_string(),
+            column: column.to_string(),
+            range: true,
+        })
+    }
+
+    fn drop_range_index(&mut self, table: &str, column: &str) -> Result<QueryResult> {
+        let mut schema = self.expect_schema(table)?;
+        let col = schema.column_index(column).ok_or_else(|| {
+            EngineError::Schema(format!("unknown column {column:?} in table {table:?}"))
+        })?;
+        if !schema.columns[col].range_indexed {
+            return Err(EngineError::Schema(format!(
+                "column {column:?} of table {table:?} has no range index"
+            )));
+        }
+        let mut batch = Batch::new();
+        batch.delete(&self.range_index_key(table, col));
+        schema.columns[col].range_indexed = false;
+        self.add_schema(&mut batch, &schema);
+        self.commit_audited(audit_kind::DROP_INDEX, self.table_tag(table), batch)?;
+        Ok(QueryResult::IndexDropped {
+            table: table.to_string(),
+            column: column.to_string(),
+            range: true,
         })
     }
 
     fn drop_table(&mut self, name: &str) -> Result<QueryResult> {
         self.expect_schema(name)?;
         let mut batch = Batch::new();
-        for prefix in [self.row_prefix(name), self.index_prefix(name)] {
+        for prefix in [
+            self.row_prefix(name),
+            self.index_prefix(name),
+            self.range_prefix(name),
+        ] {
             for (key, _) in self.storage.scan_prefix(&prefix) {
                 batch.delete(key);
             }
@@ -847,10 +948,11 @@ impl Engine {
         // index entries and the sequence land atomically together.
         let mut next_id = self.load_seq(table, &table_key)?;
         let count = batch.len();
+        let inserted_rows = batch;
         let mut writes = Batch::new();
-        for row in batch {
+        for row in &inserted_rows {
             let key = self.row_key(table, next_id);
-            let sealed = table_key.seal(&codec::encode_row(&row), &key);
+            let sealed = table_key.seal(&codec::encode_row(row), &key);
             writes.put(&key, &sealed);
             for &col in &maintained {
                 if row[col] != Value::Null {
@@ -860,6 +962,17 @@ impl Engine {
             next_id += 1;
         }
         self.add_seq(&mut writes, table, &table_key, next_id);
+        for col in range_indexed_columns(&schema) {
+            let mut entries = self.load_range_index(table, &table_key, col)?;
+            let first_id = next_id - count as u64;
+            for (offset, row) in inserted_rows.iter().enumerate() {
+                if row[col] != Value::Null {
+                    entries.push((row[col].clone(), first_id + offset as u64));
+                }
+            }
+            sort_range_entries(&mut entries);
+            self.add_range_blob(&mut writes, table, &table_key, col, &entries);
+        }
         self.commit_audited(audit_kind::INSERT, self.table_tag(table), writes)?;
         Ok(QueryResult::Inserted(count))
     }
@@ -1022,8 +1135,8 @@ impl Engine {
         let maintained = maintained_columns(&schema);
         let count = changed.len();
         let mut writes = Batch::new();
-        for (key, old_row, new_row) in changed {
-            let rowid = rowid_from_key(&key);
+        for (key, old_row, new_row) in &changed {
+            let rowid = rowid_from_key(key);
             for &col in &maintained {
                 if old_row[col] != new_row[col] {
                     if old_row[col] != Value::Null {
@@ -1041,8 +1154,26 @@ impl Engine {
                     }
                 }
             }
-            let sealed = table_key.seal(&codec::encode_row(&new_row), &key);
-            writes.put(&key, &sealed);
+            let sealed = table_key.seal(&codec::encode_row(new_row), key);
+            writes.put(key, &sealed);
+        }
+        for col in range_indexed_columns(&schema) {
+            if changed.iter().all(|(_, o, n)| o[col] == n[col]) {
+                continue;
+            }
+            let mut entries = self.load_range_index(table, &table_key, col)?;
+            for (key, old_row, new_row) in &changed {
+                if old_row[col] == new_row[col] {
+                    continue;
+                }
+                let rowid = rowid_from_key(key);
+                entries.retain(|(v, id)| !(*id == rowid && *v == old_row[col]));
+                if new_row[col] != Value::Null {
+                    entries.push((new_row[col].clone(), rowid));
+                }
+            }
+            sort_range_entries(&mut entries);
+            self.add_range_blob(&mut writes, table, &table_key, col, &entries);
         }
         self.commit_audited(audit_kind::UPDATE, self.table_tag(table), writes)?;
         Ok(QueryResult::Updated(count))
@@ -1066,14 +1197,25 @@ impl Engine {
         }
         let count = doomed.len();
         let mut writes = Batch::new();
-        for (key, row) in doomed {
-            let rowid = rowid_from_key(&key);
+        for (key, row) in &doomed {
+            let rowid = rowid_from_key(key);
             for &col in &maintained {
                 if row[col] != Value::Null {
                     self.remove_index_entry(&mut writes, table, col, &row[col], rowid);
                 }
             }
-            writes.delete(&key);
+            writes.delete(key);
+        }
+        for col in range_indexed_columns(&schema) {
+            if doomed.iter().all(|(_, row)| row[col] == Value::Null) {
+                continue;
+            }
+            let mut entries = self.load_range_index(table, &table_key, col)?;
+            for (key, row) in &doomed {
+                let rowid = rowid_from_key(key);
+                entries.retain(|(v, id)| !(*id == rowid && *v == row[col]));
+            }
+            self.add_range_blob(&mut writes, table, &table_key, col, &entries);
         }
         self.commit_audited(audit_kind::DELETE, self.table_tag(table), writes)?;
         Ok(QueryResult::Deleted(count))
@@ -1161,6 +1303,47 @@ impl Engine {
         Ok(rowids)
     }
 
+    fn range_prefix(&self, table: &str) -> Vec<u8> {
+        let mut prefix = RANGE_PREFIX.to_vec();
+        prefix.extend_from_slice(&self.table_tag(table));
+        prefix
+    }
+
+    /// Key of the sealed range-index blob for one column.
+    fn range_index_key(&self, table: &str, col: usize) -> Vec<u8> {
+        let mut key = self.range_prefix(table);
+        key.extend_from_slice(&(col as u16).to_be_bytes());
+        key
+    }
+
+    /// Decrypt and decode a column's range blob (empty if absent).
+    fn load_range_index(
+        &self,
+        table: &str,
+        table_key: &CipherKey,
+        col: usize,
+    ) -> Result<Vec<(Value, u64)>> {
+        let key = self.range_index_key(table, col);
+        match self.storage.get(&key) {
+            None => Ok(Vec::new()),
+            Some(sealed) => codec::decode_range_blob(&table_key.open(sealed, &key)?),
+        }
+    }
+
+    /// Seal a sorted range blob into the batch.
+    fn add_range_blob(
+        &self,
+        batch: &mut Batch,
+        table: &str,
+        table_key: &CipherKey,
+        col: usize,
+        entries: &[(Value, u64)],
+    ) {
+        let key = self.range_index_key(table, col);
+        let sealed = table_key.seal(&codec::encode_range_blob(entries), &key);
+        batch.put(&key, &sealed);
+    }
+
     fn add_index_entry(
         &self,
         batch: &mut Batch,
@@ -1215,6 +1398,32 @@ impl Engine {
                         let row = codec::decode_row(&table_key.open(sealed, &key)?)?;
                         rows.push((key, row));
                     }
+                }
+            }
+            return Ok(rows);
+        }
+        if let Some(filter) = filter
+            && let Some((col, op, value)) = range_indexed_pred(filter, schema)
+        {
+            // One blob decrypt, then only matching rows are fetched.
+            let mut rows = Vec::new();
+            for (entry_value, rowid) in self.load_range_index(table, table_key, col)? {
+                let ordering = compare_values(&entry_value, value);
+                let hit = match op {
+                    CmpOp::Eq => ordering.is_eq(),
+                    CmpOp::Lt => ordering.is_lt(),
+                    CmpOp::Le => ordering.is_le(),
+                    CmpOp::Gt => ordering.is_gt(),
+                    CmpOp::Ge => ordering.is_ge(),
+                    CmpOp::Ne => unreachable!("Ne never selects a range path"),
+                };
+                if !hit {
+                    continue;
+                }
+                let key = self.row_key(table, rowid);
+                if let Some(sealed) = self.storage.get(&key) {
+                    let row = codec::decode_row(&table_key.open(sealed, &key)?)?;
+                    rows.push((key, row));
                 }
             }
             return Ok(rows);
@@ -1338,6 +1547,59 @@ fn pk_column(schema: &TableSchema) -> Option<usize> {
 /// The row id encoded in the trailing 8 bytes of a row key.
 fn rowid_from_key(key: &[u8]) -> u64 {
     u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap())
+}
+
+/// Columns carrying a sealed range index.
+fn range_indexed_columns(schema: &TableSchema) -> Vec<usize> {
+    schema
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.range_indexed)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Sort range-blob entries by value (then row id, for determinism).
+fn sort_range_entries(entries: &mut [(Value, u64)]) {
+    entries.sort_by(|a, b| compare_values(&a.0, &b.0).then(a.1.cmp(&b.1)));
+}
+
+/// If the expression can only be true where `col` satisfies one
+/// comparison, return it. AND-conjuncts qualify; OR/NOT do not.
+fn range_pred_value(expr: &CompiledExpr, col: usize) -> Option<(CmpOp, &Value)> {
+    match expr {
+        CompiledExpr::Compare {
+            column_index,
+            op,
+            value,
+            ..
+        } if *column_index == col
+            && *value != Value::Null
+            && matches!(
+                op,
+                CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge | CmpOp::Eq
+            ) =>
+        {
+            Some((*op, value))
+        }
+        CompiledExpr::And(a, b) => range_pred_value(a, col).or_else(|| range_pred_value(b, col)),
+        _ => None,
+    }
+}
+
+/// Pick a range-index access path: the first range-indexed column that
+/// the predicate pins with a comparison.
+fn range_indexed_pred<'a>(
+    expr: &'a CompiledExpr,
+    schema: &TableSchema,
+) -> Option<(usize, CmpOp, &'a Value)> {
+    schema
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.range_indexed)
+        .find_map(|(col, _)| range_pred_value(expr, col).map(|(op, v)| (col, op, v)))
 }
 
 /// Columns whose index entries must be maintained on every mutation:
@@ -2076,6 +2338,150 @@ mod tests {
         assert_eq!(rows_of(db.execute("SELECT * FROM t").unwrap()).len(), 0);
         // EXPLAIN of unsupported statements is a parse error.
         assert!(db.execute("EXPLAIN CREATE TABLE u (a INT)").is_err());
+    }
+
+    #[test]
+    fn range_index_full_lifecycle() {
+        let dir = ciphra_testutil::tempdir();
+        let mut db = engine(dir.path());
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, score INT, note TEXT)")
+            .unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (1, 30, 'a'), (2, 10, 'b'), (3, NULL, 'c'), \
+             (4, 20, 'd'), (5, 10, 'e')",
+        )
+        .unwrap();
+
+        // CREATE RANGE INDEX backfills existing rows (NULLs excluded).
+        db.execute("CREATE RANGE INDEX ON t (score)").unwrap();
+
+        let ids = |db: &mut Engine, sql: &str| -> Vec<i64> {
+            rows_of(db.execute(sql).unwrap())
+                .into_iter()
+                .map(|row| match &row[0] {
+                    Value::Int(n) => *n,
+                    other => panic!("expected int, got {other:?}"),
+                })
+                .collect()
+        };
+
+        // Range predicates resolve through the sealed blob; results
+        // must match what a full scan would produce.
+        assert_eq!(
+            ids(&mut db, "SELECT id FROM t WHERE score >= 20 ORDER BY id"),
+            vec![1, 4]
+        );
+        assert_eq!(
+            ids(&mut db, "SELECT id FROM t WHERE score < 20 ORDER BY id"),
+            vec![2, 5]
+        );
+        assert_eq!(
+            ids(&mut db, "SELECT id FROM t WHERE score = 10 ORDER BY id"),
+            vec![2, 5]
+        );
+        // The full predicate still applies on top of the blob hits.
+        assert_eq!(
+            ids(
+                &mut db,
+                "SELECT id FROM t WHERE score >= 10 AND note = 'd' ORDER BY id"
+            ),
+            vec![4]
+        );
+        // NULL never matches a comparison.
+        assert_eq!(
+            ids(&mut db, "SELECT id FROM t WHERE score <= 100 ORDER BY id").len(),
+            4
+        );
+
+        // Maintained by INSERT / UPDATE / DELETE.
+        db.execute("INSERT INTO t VALUES (6, 15, 'f')").unwrap();
+        assert_eq!(
+            ids(&mut db, "SELECT id FROM t WHERE score < 20 ORDER BY id"),
+            vec![2, 5, 6]
+        );
+        db.execute("UPDATE t SET score = 40 WHERE id = 2").unwrap();
+        assert_eq!(
+            ids(&mut db, "SELECT id FROM t WHERE score > 25 ORDER BY id"),
+            vec![1, 2]
+        );
+        db.execute("UPDATE t SET score = NULL WHERE id = 5")
+            .unwrap();
+        db.execute("DELETE FROM t WHERE id = 6").unwrap();
+        assert_eq!(
+            ids(&mut db, "SELECT id FROM t WHERE score < 25 ORDER BY id"),
+            vec![4]
+        );
+
+        // Survives reopen and rotation.
+        drop(db);
+        let mut db = engine(dir.path());
+        assert_eq!(
+            ids(&mut db, "SELECT id FROM t WHERE score > 25 ORDER BY id"),
+            vec![1, 2]
+        );
+        db.rotate_to("rotated", KdfParams::Pbkdf2 { iterations: 3 })
+            .unwrap();
+        assert_eq!(
+            ids(&mut db, "SELECT id FROM t WHERE score > 25 ORDER BY id"),
+            vec![1, 2]
+        );
+
+        // EXPLAIN reports the path.
+        let plan = rows_of(
+            db.execute("EXPLAIN SELECT id FROM t WHERE score > 5")
+                .unwrap(),
+        );
+        assert_eq!(
+            plan[0][0].to_string(),
+            "SELECT: sealed range-index scan on t.score (>)"
+        );
+
+        // DROP falls back to scans with identical results.
+        db.execute("DROP RANGE INDEX ON t (score)").unwrap();
+        assert_eq!(
+            ids(&mut db, "SELECT id FROM t WHERE score > 25 ORDER BY id"),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn range_index_ddl_errors_and_leakage() {
+        let dir = ciphra_testutil::tempdir();
+        let mut db = engine(dir.path());
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, secret TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'CONFIDENTIAL-VALUE-XYZ')")
+            .unwrap();
+        db.execute("CREATE RANGE INDEX ON t (secret)").unwrap();
+
+        assert!(matches!(
+            db.execute("CREATE RANGE INDEX ON t (secret)"),
+            Err(EngineError::Schema(_))
+        ));
+        assert!(matches!(
+            db.execute("CREATE RANGE INDEX ON t (nope)"),
+            Err(EngineError::Schema(_))
+        ));
+        assert!(matches!(
+            db.execute("DROP RANGE INDEX ON t (id)"),
+            Err(EngineError::Schema(_))
+        ));
+
+        // The blob is sealed: indexed values never reach disk in the clear.
+        drop(db);
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                continue;
+            }
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(
+                !bytes
+                    .windows(b"CONFIDENTIAL-VALUE-XYZ".len())
+                    .any(|w| w == b"CONFIDENTIAL-VALUE-XYZ"),
+                "range-indexed value leaked into {path:?}"
+            );
+        }
     }
 
     #[test]

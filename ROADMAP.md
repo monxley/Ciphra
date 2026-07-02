@@ -39,9 +39,11 @@ later.
 - [x] Group commit: one fsync + one atomic (all-or-nothing) WAL
       record per statement — 34x on inserts, crash-atomic statements
 
-- [ ] Queryable encryption layers with an explicit, documented leakage
-      profile (equality via deterministic tags; range via order-revealing
-      structures — opt-in per column, never silent)
+- [x] Queryable encryption with explicit leakage profiles: equality
+      via keyed tags (deterministic class); range via *sealed* sorted
+      blobs that leak neither order nor equality — strictly less than
+      OPE/ORE, at O(n) re-seal cost per mutation. Opt-in per column,
+      never silent. (Chunked sealed pages for large tables: planned)
 - [x] Tamper-evident audit chain: sealed hash-chain entry per
       statement, committed atomically with its data; `.audit
       root`/`.audit verify`; rollback detection via external roots.

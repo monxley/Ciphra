@@ -32,9 +32,17 @@ impl Parser {
     fn statement(&mut self) -> Result<Statement, ParseError> {
         let kw = self.keyword("a statement keyword")?;
         match kw.as_str() {
-            "create" if self.eat_keyword("index") => self.index_target(true),
+            "create" if self.eat_keyword("index") => self.index_target(true, false),
+            "create" if self.eat_keyword("range") => {
+                self.expect_keyword("index")?;
+                self.index_target(true, true)
+            }
             "create" => self.create_table(),
-            "drop" if self.eat_keyword("index") => self.index_target(false),
+            "drop" if self.eat_keyword("index") => self.index_target(false, false),
+            "drop" if self.eat_keyword("range") => {
+                self.expect_keyword("index")?;
+                self.index_target(false, true)
+            }
             "drop" => self.drop_table(),
             "insert" => self.insert(),
             "select" => self.select(),
@@ -55,17 +63,25 @@ impl Parser {
         }
     }
 
-    /// `... INDEX ON table (column)` for both CREATE and DROP.
-    fn index_target(&mut self, create: bool) -> Result<Statement, ParseError> {
+    /// `... [RANGE] INDEX ON table (column)` for both CREATE and DROP.
+    fn index_target(&mut self, create: bool, range: bool) -> Result<Statement, ParseError> {
         self.expect_keyword("on")?;
         let table = self.identifier("table name")?;
         self.expect(&Token::LParen)?;
         let column = self.identifier("column name")?;
         self.expect(&Token::RParen)?;
         Ok(if create {
-            Statement::CreateIndex { table, column }
+            Statement::CreateIndex {
+                table,
+                column,
+                range,
+            }
         } else {
-            Statement::DropIndex { table, column }
+            Statement::DropIndex {
+                table,
+                column,
+                range,
+            }
         })
     }
 
@@ -99,6 +115,7 @@ impl Parser {
                 encrypted,
                 primary_key,
                 indexed: false,
+                range_indexed: false,
             });
             if !self.eat(&Token::Comma) {
                 break;

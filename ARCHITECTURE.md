@@ -118,6 +118,24 @@ only leakage is equality (the same table always maps to the same tag
 within one database). The real name is recovered by decrypting the
 catalog record, which is how `.tables` works.
 
+### Queryable encryption: three mechanisms, three leakage profiles
+
+| Mechanism | Serves | On-disk leakage |
+|---|---|---|
+| Keyed value tags (PK + `CREATE INDEX`) | `WHERE col = x` | equality repetitions of the column (deterministic-encryption class) |
+| Sealed range index (`CREATE RANGE INDEX`) | `< <= > >= =` comparisons | **none about values or order** — only total blob size and update frequency |
+| Full scan (always available) | everything else | none |
+
+The sealed range index is one sorted `(value, row id)` list per column,
+kept entirely inside a single ciphertext. Because the ordering lives
+*inside* the envelope, disk shows nothing an OPE/ORE scheme would leak
+— no order, no equality. The price is honest too: every mutation of the
+column re-seals the whole blob (O(n) write amplification), which is the
+right trade for small-to-medium tables; chunked sealed pages are the
+planned upgrade for large ones. Queries pay one blob decrypt and then
+fetch only matching rows. Indexes of both kinds are opt-in per column,
+never created silently.
+
 ### Why hand-written primitives?
 
 The core is dependency-free by policy (see ADR-0002): for an encrypted
@@ -176,6 +194,7 @@ queryable-encryption levels, which will need it.
 
 ```
 \x00canary                  sealed wrong-passphrase detector
+z\x00<tag16><col>           sealed range-index blob (sorted values + row ids)
 \x00catalog\x00<tag16>      sealed schema (incl. the real table name)
 \x00seq\x00<tag16>          sealed next row id (u64)
 r\x00<tag16><id BE>         sealed row (big-endian id keeps key order = insert order)

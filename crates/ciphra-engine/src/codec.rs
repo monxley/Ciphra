@@ -28,6 +28,7 @@ impl TableSchema {
 const FLAG_ENCRYPTED: u8 = 1 << 0;
 const FLAG_PRIMARY_KEY: u8 = 1 << 1;
 const FLAG_INDEXED: u8 = 1 << 2;
+const FLAG_RANGE_INDEXED: u8 = 1 << 3;
 
 /// Schema layout: `version (1) | name_len (2 LE) | name | ncols (2 LE)`
 /// then per column: `flags (1) | type (1) | name_len (2 LE) | name`.
@@ -46,6 +47,9 @@ pub fn encode_schema(schema: &TableSchema) -> Vec<u8> {
         }
         if col.indexed {
             flags |= FLAG_INDEXED;
+        }
+        if col.range_indexed {
+            flags |= FLAG_RANGE_INDEXED;
         }
         out.push(flags);
         out.push(match col.ty {
@@ -83,6 +87,7 @@ pub fn decode_schema(buf: &[u8]) -> Result<TableSchema> {
         let encrypted = flags & FLAG_ENCRYPTED != 0;
         let primary_key = flags & FLAG_PRIMARY_KEY != 0;
         let indexed = flags & FLAG_INDEXED != 0;
+        let range_indexed = flags & FLAG_RANGE_INDEXED != 0;
         let ty = match buf[pos + 1] {
             TAG_INT => DataType::Int,
             TAG_TEXT => DataType::Text,
@@ -103,6 +108,7 @@ pub fn decode_schema(buf: &[u8]) -> Result<TableSchema> {
             encrypted,
             primary_key,
             indexed,
+            range_indexed,
         });
     }
     if pos != buf.len() {
@@ -177,6 +183,55 @@ pub fn decode_row(buf: &[u8]) -> Result<Vec<Value>> {
     Ok(values)
 }
 
+/// Sealed range-index blob: `count (8 LE)` then per entry
+/// `value_len (4 LE) | encoded value | rowid (8 LE)`, sorted by value.
+pub fn encode_range_blob(entries: &[(Value, u64)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + entries.len() * 24);
+    out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+    for (value, rowid) in entries {
+        let encoded = encode_row(std::slice::from_ref(value));
+        out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        out.extend_from_slice(&encoded);
+        out.extend_from_slice(&rowid.to_le_bytes());
+    }
+    out
+}
+
+pub fn decode_range_blob(buf: &[u8]) -> Result<Vec<(Value, u64)>> {
+    let corrupt = || EngineError::Corrupt("bad range-index blob".into());
+    if buf.len() < 8 {
+        return Err(corrupt());
+    }
+    let count = u64::from_le_bytes(buf[..8].try_into().unwrap()) as usize;
+    let mut pos = 8usize;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len_bytes: [u8; 4] = buf
+            .get(pos..pos + 4)
+            .ok_or_else(corrupt)?
+            .try_into()
+            .unwrap();
+        let len = u32::from_le_bytes(len_bytes) as usize;
+        pos += 4;
+        let mut row = decode_row(buf.get(pos..pos + len).ok_or_else(corrupt)?)?;
+        if row.len() != 1 {
+            return Err(corrupt());
+        }
+        pos += len;
+        let rowid_bytes: [u8; 8] = buf
+            .get(pos..pos + 8)
+            .ok_or_else(corrupt)?
+            .try_into()
+            .unwrap();
+        pos += 8;
+        entries.push((row.remove(0), u64::from_le_bytes(rowid_bytes)));
+    }
+    if pos != buf.len() {
+        return Err(corrupt());
+    }
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +247,7 @@ mod tests {
                     encrypted: false,
                     primary_key: true,
                     indexed: false,
+                    range_indexed: false,
                 },
                 ColumnDef {
                     name: "ssn".into(),
@@ -199,6 +255,7 @@ mod tests {
                     encrypted: true,
                     primary_key: false,
                     indexed: true,
+                    range_indexed: true,
                 },
             ],
         };
@@ -215,6 +272,19 @@ mod tests {
             Value::Int(i64::MAX),
         ];
         assert_eq!(decode_row(&encode_row(&row)).unwrap(), row);
+    }
+
+    #[test]
+    fn range_blob_roundtrip() {
+        let entries = vec![
+            (Value::Int(-5), 3u64),
+            (Value::Int(0), 1),
+            (Value::Int(7), 2),
+        ];
+        let blob = encode_range_blob(&entries);
+        assert_eq!(decode_range_blob(&blob).unwrap(), entries);
+        assert!(decode_range_blob(&blob[..blob.len() - 1]).is_err());
+        assert_eq!(decode_range_blob(&encode_range_blob(&[])).unwrap(), vec![]);
     }
 
     #[test]
