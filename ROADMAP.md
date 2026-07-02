@@ -51,7 +51,9 @@ later.
 - [x] `VECTOR(dim)` type + `ORDER BY col NEAREST TO [..]` similarity
       search: exact brute-force cosine over sealed rows (sealed-blob
       ANN index for large corpora: planned)
-- [ ] Backup/restore, snapshot export (sealed)
+- [x] Backup/restore: `--backup` writes a compacted sealed snapshot
+      (single self-contained file, audit chain included); `--restore`
+      verifies passphrase + chain and refuses to overwrite
 
 ## Phase 3 — Multi-node and hardening
 

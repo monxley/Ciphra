@@ -169,6 +169,17 @@ impl Storage {
         self.map.is_empty()
     }
 
+    /// Write the live state as a fresh, compacted WAL at `path`.
+    /// The result is a complete, self-contained database file.
+    pub fn snapshot_to(&self, path: impl AsRef<Path>) -> Result<()> {
+        let mut out = File::create(path.as_ref())?;
+        for (key, value) in &self.map {
+            out.write_all(&encode_record(OP_PUT, key, value))?;
+        }
+        out.sync_all()?;
+        Ok(())
+    }
+
     /// Rewrite the WAL so it contains exactly the live state.
     pub fn compact(&mut self) -> Result<()> {
         let tmp_path = self.wal_path.with_extension("wal.tmp");

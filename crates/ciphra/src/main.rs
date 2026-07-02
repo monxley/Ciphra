@@ -24,6 +24,8 @@ fn run() -> Result<ExitCode, String> {
     let mut data_dir = DEFAULT_DATA_DIR.to_string();
     let mut execute: Vec<String> = Vec::new();
     let mut rotate = false;
+    let mut backup: Option<String> = None;
+    let mut restore: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -35,6 +37,12 @@ fn run() -> Result<ExitCode, String> {
                 execute.push(args.next().ok_or("-e requires a SQL argument")?);
             }
             "--rotate-passphrase" => rotate = true,
+            "--backup" => {
+                backup = Some(args.next().ok_or("--backup requires a file argument")?);
+            }
+            "--restore" => {
+                restore = Some(args.next().ok_or("--restore requires a file argument")?);
+            }
             "--help" | "-h" => {
                 print_usage();
                 return Ok(ExitCode::SUCCESS);
@@ -57,7 +65,28 @@ fn run() -> Result<ExitCode, String> {
         }
     };
 
+    if let Some(snapshot) = restore {
+        let engine =
+            Engine::restore_from(&snapshot, &data_dir, &passphrase).map_err(|e| e.to_string())?;
+        let (seq, root) = engine.audit_root();
+        println!("restored {snapshot} into {data_dir}");
+        println!(
+            "audit head: seq {seq}, root {} (chain verified)",
+            hex(&root)
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let mut engine = Engine::open(&data_dir, &passphrase).map_err(|e| e.to_string())?;
+
+    if let Some(path) = backup {
+        engine.backup_to(&path).map_err(|e| e.to_string())?;
+        let (seq, root) = engine.audit_root();
+        println!("backup written to {path}");
+        println!("audit head: seq {seq}, root {}", hex(&root));
+        println!("(record these with the backup; verify them after any restore)");
+        return Ok(ExitCode::SUCCESS);
+    }
 
     if rotate {
         let new_passphrase = match std::env::var(NEW_PASSPHRASE_ENV) {
@@ -97,6 +126,8 @@ OPTIONS:
     -d, --data <DIR>     Data directory (default: {DEFAULT_DATA_DIR})
     -e, --execute <SQL>  Execute statements and exit (repeatable)
     --rotate-passphrase  Re-encrypt the database under {NEW_PASSPHRASE_ENV}
+    --backup <FILE>      Write a sealed snapshot of the database
+    --restore <FILE>     Restore a snapshot into --data (must be empty)
     -h, --help           Show this help
     -V, --version        Show version
 
