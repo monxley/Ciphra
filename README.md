@@ -89,7 +89,11 @@ rather than add-ons.
   database under a new passphrase (new salt, new KDF, new table and
   index tags) with an atomic file swap — a crash cannot strand the
   database between two keys.
-- **CLI/REPL** with meta commands (`.tables`, `.schema`, `.help`).
+- **Sealed backup/restore**: `--backup file` exports one
+  self-contained encrypted snapshot (audit chain included);
+  `--restore file` verifies the passphrase and the chain before use.
+- **CLI/REPL** with meta commands (`.tables`, `.schema`, `.audit`,
+  `.help`).
 
 ## Quick start
 

@@ -412,6 +412,45 @@ impl Engine {
         })
     }
 
+    /// Write a consistent, sealed snapshot of the database to `path`.
+    ///
+    /// The snapshot is a complete single-file database (same format as
+    /// the live WAL, compacted): everything in it is sealed, and it
+    /// carries the audit chain, so its integrity can be verified after
+    /// restore. Record the current [`Engine::audit_root`] alongside the
+    /// backup to be able to prove the restored copy is this exact state.
+    pub fn backup_to(&self, path: impl AsRef<Path>) -> Result<()> {
+        self.storage.snapshot_to(path.as_ref())?;
+        Ok(())
+    }
+
+    /// Restore a snapshot produced by [`Engine::backup_to`] into `dir`
+    /// and open it. Refuses to overwrite an existing database.
+    pub fn restore_from(
+        snapshot: impl AsRef<Path>,
+        dir: impl AsRef<Path>,
+        passphrase: &str,
+    ) -> Result<Self> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir)?;
+        let wal = dir.join(ciphra_storage::WAL_FILE);
+        if wal.exists() {
+            return Err(EngineError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("{} already contains a database", dir.display()),
+            )));
+        }
+        std::fs::copy(snapshot.as_ref(), &wal)?;
+        if let Ok(dir_handle) = std::fs::File::open(dir) {
+            let _ = dir_handle.sync_all();
+        }
+        // Opening verifies the passphrase (canary); verifying the audit
+        // chain proves the snapshot's history is intact.
+        let engine = Engine::open(dir, passphrase)?;
+        engine.audit_verify()?;
+        Ok(engine)
+    }
+
     /// The current audit head: how many statements the chain covers and
     /// the root that commits to all of them. Safe to publish or store
     /// externally — comparing it later detects history rollback.
@@ -2444,6 +2483,55 @@ mod tests {
         assert_eq!(rows_of(db.execute("SELECT * FROM t").unwrap()).len(), 0);
         // EXPLAIN of unsupported statements is a parse error.
         assert!(db.execute("EXPLAIN CREATE TABLE u (a INT)").is_err());
+    }
+
+    #[test]
+    fn backup_and_restore_roundtrip() {
+        let dir = ciphra_testutil::tempdir();
+        let backup_dir = ciphra_testutil::tempdir();
+        let snapshot = backup_dir.path().join("ciphra.backup");
+
+        let mut db = engine(dir.path());
+        db.execute(
+            "CREATE TABLE t (id INT PRIMARY KEY, v TEXT); \
+             INSERT INTO t VALUES (1, 'kept'), (2, 'also-kept');",
+        )
+        .unwrap();
+        let head_at_backup = db.audit_root();
+        db.backup_to(&snapshot).unwrap();
+
+        // Mutations after the backup do not affect the snapshot.
+        db.execute("DELETE FROM t WHERE id = 2").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'newer')").unwrap();
+
+        // Restore into a fresh directory: state and audit head are the
+        // ones from the moment of the backup, and the chain verifies.
+        let restore_dir = ciphra_testutil::tempdir();
+        let mut restored =
+            Engine::restore_from(&snapshot, restore_dir.path(), "test-passphrase").unwrap();
+        assert_eq!(restored.audit_root(), head_at_backup);
+        assert_eq!(
+            rows_of(restored.execute("SELECT * FROM t").unwrap()).len(),
+            2
+        );
+        // The restored database is fully writable.
+        restored
+            .execute("INSERT INTO t VALUES (9, 'post-restore')")
+            .unwrap();
+        restored.audit_verify().unwrap();
+
+        // Restoring over an existing database is refused.
+        let err = Engine::restore_from(&snapshot, dir.path(), "test-passphrase")
+            .err()
+            .expect("must refuse to overwrite");
+        assert!(matches!(err, EngineError::Io(_)), "got {err:?}");
+
+        // A wrong passphrase cannot open the restored snapshot.
+        let another = ciphra_testutil::tempdir();
+        let err = Engine::restore_from(&snapshot, another.path(), "wrong")
+            .err()
+            .expect("wrong passphrase must fail");
+        assert!(matches!(err, EngineError::BadPassphrase), "got {err:?}");
     }
 
     #[test]
