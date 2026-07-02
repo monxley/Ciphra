@@ -1,0 +1,11 @@
+[package]
+name = "ciphra-testutil"
+description = "Test-only helpers shared across Ciphra crates"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]

@@ -1,0 +1,253 @@
+//! Recursive-descent parser for the Ciphra SQL dialect.
+
+use crate::lexer::{Token, tokenize};
+use crate::{CmpOp, ColumnDef, DataType, Literal, ParseError, Predicate, Projection, Statement};
+
+/// Parse zero or more `;`-separated statements.
+pub fn parse_statements(input: &str) -> Result<Vec<Statement>, ParseError> {
+    let tokens = tokenize(input)?;
+    let mut parser = Parser { tokens, pos: 0 };
+    let mut statements = Vec::new();
+    loop {
+        while parser.eat(&Token::Semi) {}
+        if parser.at_end() {
+            return Ok(statements);
+        }
+        statements.push(parser.statement()?);
+        if !parser.at_end() && !parser.check(&Token::Semi) {
+            return Err(parser.unexpected("';' or end of input"));
+        }
+    }
+}
+
+struct Parser {
+    tokens: Vec<Token>,
+    pos: usize,
+}
+
+impl Parser {
+    fn statement(&mut self) -> Result<Statement, ParseError> {
+        let kw = self.keyword("a statement keyword")?;
+        match kw.as_str() {
+            "create" => self.create_table(),
+            "drop" => self.drop_table(),
+            "insert" => self.insert(),
+            "select" => self.select(),
+            "delete" => self.delete(),
+            other => Err(ParseError(format!("unknown statement: {other:?}"))),
+        }
+    }
+
+    fn create_table(&mut self) -> Result<Statement, ParseError> {
+        self.expect_keyword("table")?;
+        let name = self.identifier("table name")?;
+        self.expect(&Token::LParen)?;
+        let mut columns = Vec::new();
+        loop {
+            let col_name = self.identifier("column name")?;
+            let ty = match self.keyword("a column type (INT or TEXT)")?.as_str() {
+                "int" | "integer" => DataType::Int,
+                "text" | "varchar" => DataType::Text,
+                other => return Err(ParseError(format!("unknown column type: {other:?}"))),
+            };
+            let encrypted = self.eat_keyword("encrypted");
+            columns.push(ColumnDef {
+                name: col_name,
+                ty,
+                encrypted,
+            });
+            if !self.eat(&Token::Comma) {
+                break;
+            }
+        }
+        self.expect(&Token::RParen)?;
+        Ok(Statement::CreateTable { name, columns })
+    }
+
+    fn drop_table(&mut self) -> Result<Statement, ParseError> {
+        self.expect_keyword("table")?;
+        let name = self.identifier("table name")?;
+        Ok(Statement::DropTable { name })
+    }
+
+    fn insert(&mut self) -> Result<Statement, ParseError> {
+        self.expect_keyword("into")?;
+        let table = self.identifier("table name")?;
+        let columns = if self.eat(&Token::LParen) {
+            let mut cols = vec![self.identifier("column name")?];
+            while self.eat(&Token::Comma) {
+                cols.push(self.identifier("column name")?);
+            }
+            self.expect(&Token::RParen)?;
+            Some(cols)
+        } else {
+            None
+        };
+        self.expect_keyword("values")?;
+        let mut rows = vec![self.value_tuple()?];
+        while self.eat(&Token::Comma) {
+            rows.push(self.value_tuple()?);
+        }
+        Ok(Statement::Insert {
+            table,
+            columns,
+            rows,
+        })
+    }
+
+    fn value_tuple(&mut self) -> Result<Vec<Literal>, ParseError> {
+        self.expect(&Token::LParen)?;
+        let mut values = vec![self.literal()?];
+        while self.eat(&Token::Comma) {
+            values.push(self.literal()?);
+        }
+        self.expect(&Token::RParen)?;
+        Ok(values)
+    }
+
+    fn select(&mut self) -> Result<Statement, ParseError> {
+        let columns = if self.eat(&Token::Star) {
+            Projection::All
+        } else {
+            let mut cols = vec![self.identifier("column name")?];
+            while self.eat(&Token::Comma) {
+                cols.push(self.identifier("column name")?);
+            }
+            Projection::Columns(cols)
+        };
+        self.expect_keyword("from")?;
+        let table = self.identifier("table name")?;
+        let predicate = self.optional_where()?;
+        Ok(Statement::Select {
+            columns,
+            table,
+            predicate,
+        })
+    }
+
+    fn delete(&mut self) -> Result<Statement, ParseError> {
+        self.expect_keyword("from")?;
+        let table = self.identifier("table name")?;
+        let predicate = self.optional_where()?;
+        Ok(Statement::Delete { table, predicate })
+    }
+
+    fn optional_where(&mut self) -> Result<Option<Predicate>, ParseError> {
+        if !self.eat_keyword("where") {
+            return Ok(None);
+        }
+        let column = self.identifier("column name")?;
+        let op = match self.next("a comparison operator")? {
+            Token::Eq => CmpOp::Eq,
+            Token::Ne => CmpOp::Ne,
+            Token::Lt => CmpOp::Lt,
+            Token::Gt => CmpOp::Gt,
+            Token::Le => CmpOp::Le,
+            Token::Ge => CmpOp::Ge,
+            other => {
+                return Err(ParseError(format!(
+                    "expected a comparison operator, found {other}"
+                )));
+            }
+        };
+        let value = self.literal()?;
+        Ok(Some(Predicate { column, op, value }))
+    }
+
+    fn literal(&mut self) -> Result<Literal, ParseError> {
+        match self.next("a literal")? {
+            Token::Int(n) => Ok(Literal::Int(n)),
+            Token::Str(s) => Ok(Literal::Text(s)),
+            Token::Minus => match self.next("an integer")? {
+                Token::Int(n) => Ok(Literal::Int(-n)),
+                other => Err(ParseError(format!(
+                    "expected an integer after '-', found {other}"
+                ))),
+            },
+            Token::Ident(kw) if kw == "null" => Ok(Literal::Null),
+            other => Err(ParseError(format!("expected a literal, found {other}"))),
+        }
+    }
+
+    // -- token helpers -------------------------------------------------
+
+    fn at_end(&self) -> bool {
+        self.pos >= self.tokens.len()
+    }
+
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.pos)
+    }
+
+    fn next(&mut self, expected: &str) -> Result<Token, ParseError> {
+        let token = self
+            .tokens
+            .get(self.pos)
+            .cloned()
+            .ok_or_else(|| ParseError(format!("expected {expected}, found end of input")))?;
+        self.pos += 1;
+        Ok(token)
+    }
+
+    fn check(&self, token: &Token) -> bool {
+        self.peek() == Some(token)
+    }
+
+    fn eat(&mut self, token: &Token) -> bool {
+        if self.check(token) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect(&mut self, token: &Token) -> Result<(), ParseError> {
+        if self.eat(token) {
+            Ok(())
+        } else {
+            Err(self.unexpected(&format!("'{token}'")))
+        }
+    }
+
+    /// Consume any identifier-shaped token and return it (lowercased).
+    fn keyword(&mut self, expected: &str) -> Result<String, ParseError> {
+        match self.next(expected)? {
+            Token::Ident(s) => Ok(s),
+            other => Err(ParseError(format!("expected {expected}, found {other}"))),
+        }
+    }
+
+    fn expect_keyword(&mut self, kw: &str) -> Result<(), ParseError> {
+        let found = self.keyword(&format!("keyword {}", kw.to_uppercase()))?;
+        if found == kw {
+            Ok(())
+        } else {
+            Err(ParseError(format!(
+                "expected keyword {}, found {found:?}",
+                kw.to_uppercase()
+            )))
+        }
+    }
+
+    fn eat_keyword(&mut self, kw: &str) -> bool {
+        if let Some(Token::Ident(s)) = self.peek()
+            && s == kw
+        {
+            self.pos += 1;
+            return true;
+        }
+        false
+    }
+
+    fn identifier(&mut self, expected: &str) -> Result<String, ParseError> {
+        self.keyword(expected)
+    }
+
+    fn unexpected(&self, expected: &str) -> ParseError {
+        match self.peek() {
+            Some(token) => ParseError(format!("expected {expected}, found {token}")),
+            None => ParseError(format!("expected {expected}, found end of input")),
+        }
+    }
+}

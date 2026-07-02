@@ -1,0 +1,13 @@
+[package]
+name = "ciphra-storage"
+description = "Ciphra storage engine: write-ahead log + ordered in-memory table"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+ciphra-testutil.workspace = true

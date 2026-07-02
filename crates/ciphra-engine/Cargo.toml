@@ -1,0 +1,16 @@
+[package]
+name = "ciphra-engine"
+description = "Ciphra execution engine: catalog, row codec and query execution over encrypted storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ciphra-storage.workspace = true
+ciphra-crypto.workspace = true
+ciphra-sql.workspace = true
+
+[dev-dependencies]
+ciphra-testutil.workspace = true

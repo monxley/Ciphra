@@ -1,0 +1,5 @@
+/target
+**/target
+ciphra-data/
+*.wal
+.DS_Store

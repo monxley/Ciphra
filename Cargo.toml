@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ciphra-storage",
+    "crates/ciphra-crypto",
+    "crates/ciphra-sql",
+    "crates/ciphra-engine",
+    "crates/ciphra",
+    "crates/ciphra-testutil",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/monxley/Ciphra"
+authors = ["Ciphra Contributors"]
+
+# The core is intentionally free of third-party dependencies: the
+# supply chain of an encrypted database should be auditable in one repo.
+[workspace.dependencies]
+ciphra-storage = { path = "crates/ciphra-storage" }
+ciphra-crypto = { path = "crates/ciphra-crypto" }
+ciphra-sql = { path = "crates/ciphra-sql" }
+ciphra-engine = { path = "crates/ciphra-engine" }
+ciphra-testutil = { path = "crates/ciphra-testutil" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

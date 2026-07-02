@@ -1,0 +1,15 @@
+[package]
+name = "ciphra"
+description = "Ciphra: an encrypted-by-default SQL database. CLI and REPL."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "ciphra"
+path = "src/main.rs"
+
+[dependencies]
+ciphra-engine.workspace = true
