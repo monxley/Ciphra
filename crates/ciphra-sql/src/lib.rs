@@ -65,6 +65,9 @@ pub enum Statement {
         table: String,
         predicate: Option<Expr>,
     },
+    /// `EXPLAIN <select|update|delete>` — describe the access path
+    /// without executing the statement.
+    Explain(Box<Statement>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -127,6 +130,30 @@ pub enum Expr {
     Not(Box<Expr>),
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
+}
+
+impl std::fmt::Display for Literal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Literal::Null => write!(f, "NULL"),
+            Literal::Int(n) => write!(f, "{n}"),
+            Literal::Text(s) => write!(f, "'{}'", s.replace('\'', "''")),
+        }
+    }
+}
+
+impl std::fmt::Display for Expr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Expr::Compare { column, op, value } => write!(f, "{column} {op} {value}"),
+            Expr::IsNull { column, negated } => {
+                write!(f, "{column} IS {}NULL", if *negated { "NOT " } else { "" })
+            }
+            Expr::Not(inner) => write!(f, "NOT ({inner})"),
+            Expr::And(a, b) => write!(f, "({a} AND {b})"),
+            Expr::Or(a, b) => write!(f, "({a} OR {b})"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

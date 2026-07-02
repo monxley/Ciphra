@@ -29,8 +29,10 @@ later.
       7693/9106, RFC test vectors; PBKDF2 databases keep opening)
 - [x] Key rotation: whole-database re-encryption under a new
       passphrase/KDF with an atomic WAL swap (`--rotate-passphrase`)
-- [ ] `EXPLAIN`, basic statistics
-- [ ] Benchmarks vs SQLite (honest numbers, encryption cost included)
+- [x] `EXPLAIN` for SELECT/UPDATE/DELETE (access path, filter,
+      sort, limit — without executing)
+- [x] Benchmark harness + baseline numbers (docs/BENCHMARKS.md);
+      vs-SQLite script included, needs an environment with sqlite3
 
 ## Phase 2 — The crypto features that justify the name
 

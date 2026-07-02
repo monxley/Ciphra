@@ -40,6 +40,17 @@ impl Parser {
             "select" => self.select(),
             "update" => self.update(),
             "delete" => self.delete(),
+            "explain" => {
+                let inner = self.statement()?;
+                match inner {
+                    Statement::Select { .. }
+                    | Statement::Update { .. }
+                    | Statement::Delete { .. } => Ok(Statement::Explain(Box::new(inner))),
+                    _ => Err(ParseError(
+                        "EXPLAIN supports SELECT, UPDATE and DELETE".into(),
+                    )),
+                }
+            }
             other => Err(ParseError(format!("unknown statement: {other:?}"))),
         }
     }

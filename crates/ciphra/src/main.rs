@@ -183,6 +183,7 @@ fn meta_command(engine: &mut Engine, command: &str) -> bool {
     DELETE FROM t WHERE name = 'bob';
     CREATE INDEX ON t (name);
     DROP INDEX ON t (name);
+    EXPLAIN SELECT * FROM t WHERE id = 2;
     DROP TABLE t;
 
 All rows are ChaCha20-Poly1305 encrypted before they reach disk."

@@ -429,7 +429,74 @@ impl Engine {
                 predicate,
             } => self.update(&table, assignments, predicate),
             Statement::Delete { table, predicate } => self.delete(&table, predicate),
+            Statement::Explain(inner) => self.explain(*inner),
         }
+    }
+
+    /// Describe how a statement would be executed, without running it.
+    fn explain(&self, inner: Statement) -> Result<QueryResult> {
+        let (action, table, predicate, order_by, limit) = match &inner {
+            Statement::Select {
+                table,
+                predicate,
+                order_by,
+                limit,
+                ..
+            } => (
+                "SELECT",
+                table,
+                predicate,
+                order_by.as_ref(),
+                limit.as_ref(),
+            ),
+            Statement::Update {
+                table, predicate, ..
+            } => ("UPDATE", table, predicate, None, None),
+            Statement::Delete { table, predicate } => ("DELETE", table, predicate, None, None),
+            _ => {
+                return Err(EngineError::Schema(
+                    "EXPLAIN supports SELECT, UPDATE and DELETE".into(),
+                ));
+            }
+        };
+        let schema = self.expect_schema(table)?;
+        let compiled = predicate
+            .clone()
+            .map(|p| compile_expr(&schema, p))
+            .transpose()?;
+
+        let mut steps = Vec::new();
+        match compiled.as_ref().and_then(|f| indexed_eq_value(f, &schema)) {
+            Some((col, _)) => {
+                let kind = if schema.columns[col].primary_key {
+                    "primary key"
+                } else {
+                    "secondary index"
+                };
+                steps.push(format!(
+                    "{action}: {kind} lookup on {}.{}",
+                    schema.name, schema.columns[col].name
+                ));
+            }
+            None => steps.push(format!("{action}: full scan of {}", schema.name)),
+        }
+        if let Some(predicate) = predicate {
+            steps.push(format!("filter: {predicate}"));
+        }
+        if let Some(ob) = order_by {
+            steps.push(format!(
+                "sort by {}{}",
+                ob.column,
+                if ob.descending { " DESC" } else { "" }
+            ));
+        }
+        if let Some(l) = limit {
+            steps.push(format!("limit {} offset {}", l.count, l.offset));
+        }
+        Ok(QueryResult::Rows {
+            columns: vec!["plan".into()],
+            rows: steps.into_iter().map(|s| vec![Value::Text(s)]).collect(),
+        })
     }
 
     fn create_table(&mut self, name: String, columns: Vec<ColumnDef>) -> Result<QueryResult> {
@@ -1715,6 +1782,55 @@ mod tests {
             .err()
             .expect("wrong passphrase must fail");
         assert!(matches!(err, EngineError::BadPassphrase), "got {err:?}");
+    }
+
+    #[test]
+    fn explain_reports_access_paths() {
+        let dir = ciphra_testutil::tempdir();
+        let mut db = engine(dir.path());
+        db.execute(
+            "CREATE TABLE t (id INT PRIMARY KEY, grp TEXT, note TEXT); \
+             CREATE INDEX ON t (grp);",
+        )
+        .unwrap();
+
+        let plan = |db: &mut Engine, sql: &str| -> Vec<String> {
+            rows_of(db.execute(sql).unwrap())
+                .into_iter()
+                .map(|row| row[0].to_string())
+                .collect()
+        };
+
+        let steps = plan(
+            &mut db,
+            "EXPLAIN SELECT * FROM t WHERE id = 5 AND note = 'x'",
+        );
+        assert_eq!(steps[0], "SELECT: primary key lookup on t.id");
+        assert_eq!(steps[1], "filter: (id = 5 AND note = 'x')");
+
+        let steps = plan(
+            &mut db,
+            "EXPLAIN SELECT * FROM t WHERE grp = 'a' ORDER BY id DESC LIMIT 3",
+        );
+        assert_eq!(steps[0], "SELECT: secondary index lookup on t.grp");
+        assert_eq!(steps[2], "sort by id DESC");
+        assert_eq!(steps[3], "limit 3 offset 0");
+
+        // OR does not pin a column; NOT and IS NULL render readably.
+        let steps = plan(
+            &mut db,
+            "EXPLAIN DELETE FROM t WHERE id = 1 OR NOT grp IS NULL",
+        );
+        assert_eq!(steps[0], "DELETE: full scan of t");
+        assert_eq!(steps[1], "filter: (id = 1 OR NOT (grp IS NULL))");
+
+        let steps = plan(&mut db, "EXPLAIN UPDATE t SET note = 'y' WHERE id = 2");
+        assert_eq!(steps[0], "UPDATE: primary key lookup on t.id");
+
+        // EXPLAIN does not execute: no rows were touched.
+        assert_eq!(rows_of(db.execute("SELECT * FROM t").unwrap()).len(), 0);
+        // EXPLAIN of unsupported statements is a parse error.
+        assert!(db.execute("EXPLAIN CREATE TABLE u (a INT)").is_err());
     }
 
     #[test]

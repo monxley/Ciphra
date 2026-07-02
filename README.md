@@ -109,9 +109,9 @@ deliberately does not yet.
 
 ## Roadmap (abridged)
 
-- **Phase 1** (nearly done) — richer SQL ✅, encrypted table names ✅,
-  primary keys ✅, secondary indexes ✅, Argon2id KDF ✅, key
-  rotation ✅; next: `EXPLAIN`, benchmarks vs SQLite.
+- **Phase 1** ✅ — richer SQL, encrypted table names, primary keys,
+  secondary indexes, Argon2id KDF, key rotation, `EXPLAIN`,
+  benchmark baseline ([docs/BENCHMARKS.md](docs/BENCHMARKS.md)).
 - **Phase 2** — queryable encryption (deterministic/order-revealing
   layers with an explicit leakage profile), Merkle-tree audit log,
   vector type + similarity search.
@@ -126,6 +126,7 @@ The full plan lives in [ROADMAP.md](ROADMAP.md).
 cargo test          # all tests, including RFC/NIST crypto vectors
 cargo clippy --all-targets
 cargo fmt --check
+cargo run --release -p ciphra-bench   # honest numbers: docs/BENCHMARKS.md
 ```
 
 Design decisions are recorded in [docs/adr/](docs/adr/).

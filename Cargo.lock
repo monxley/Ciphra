@@ -10,6 +10,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ciphra-bench"
+version = "0.0.1"
+dependencies = [
+ "ciphra-engine",
+ "ciphra-testutil",
+]
+
+[[package]]
 name = "ciphra-crypto"
 version = "0.0.1"
 
