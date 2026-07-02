@@ -50,6 +50,10 @@ rather than add-ons.
 - **`PRIMARY KEY`** with uniqueness and non-NULL enforcement, backed by
   an encrypted equality index: `WHERE pk = x` is a point lookup, not a
   scan — and the index stores only keyed tags of values, never values.
+- **Secondary indexes** (`CREATE INDEX ON t (col)` / `DROP INDEX`):
+  the same value-tag construction, non-unique, backfilled on creation
+  and maintained by every INSERT/UPDATE/DELETE. Opt-in per column, with
+  a documented leakage profile (equality repetitions only).
 - **Durable storage engine**: checksummed write-ahead log with crash
   recovery (torn writes are detected via CRC-32 and truncated) and log
   compaction.

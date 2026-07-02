@@ -20,17 +20,23 @@
 //! Key layout inside storage (every value is sealed):
 //!
 //! ```text
-//! \x00canary               -> sealed marker to detect a wrong passphrase
-//! \x00catalog\x00<tag16>   -> sealed TableSchema (incl. the real name)
-//! \x00seq\x00<tag16>       -> sealed next row id (u64 LE)
-//! r\x00<tag16><id BE>      -> sealed row
-//! x\x00<tag16><vtag16>     -> sealed row id: PRIMARY KEY index entry
+//! \x00canary                        -> sealed marker to detect a wrong passphrase
+//! \x00catalog\x00<tag16>            -> sealed TableSchema (incl. the real name)
+//! \x00seq\x00<tag16>                -> sealed next row id (u64 LE)
+//! r\x00<tag16><id BE>               -> sealed row
+//! x\x00<tag16><col BE2><vtag16><id BE> -> sealed marker: equality-index entry
 //! ```
 //!
-//! `<vtag16>` is a keyed tag of the primary-key *value*, so equality
-//! lookups are O(log n) without ever storing the value itself. The
-//! documented leakage: which index entry a lookup touches, and (since
-//! PK values are unique) nothing about repeats across live rows.
+//! One index format serves both the PRIMARY KEY (which additionally
+//! enforces uniqueness) and `CREATE INDEX` columns: `<vtag16>` is a
+//! keyed tag of the column *value*, the row id lives in the key, and
+//! the sealed empty payload makes every entry tamper-evident. Equality
+//! lookups are prefix scans that never materialize the value on disk.
+//! Documented leakage: which entries a lookup touches, and — for
+//! secondary indexes — repetitions of the indexed column across rows
+//! (opt-in per column via CREATE INDEX, never silent). PK values are
+//! unique among live rows, so their tags repeat only across
+//! delete/re-insert cycles.
 //!
 //! Multi-key mutations (row + index entry) are not atomic yet: a crash
 //! between the two writes can leave a dangling index entry, which
@@ -138,6 +144,14 @@ pub type Result<T> = std::result::Result<T, EngineError>;
 pub enum QueryResult {
     Created(String),
     Dropped(String),
+    IndexCreated {
+        table: String,
+        column: String,
+    },
+    IndexDropped {
+        table: String,
+        column: String,
+    },
     Inserted(usize),
     Updated(usize),
     Deleted(usize),
@@ -249,6 +263,8 @@ impl Engine {
         match statement {
             Statement::CreateTable { name, columns } => self.create_table(name, columns),
             Statement::DropTable { name } => self.drop_table(&name),
+            Statement::CreateIndex { table, column } => self.create_index(&table, &column),
+            Statement::DropIndex { table, column } => self.drop_index(&table, &column),
             Statement::Insert {
                 table,
                 columns,
@@ -294,13 +310,70 @@ impl Engine {
             name: name.clone(),
             columns,
         };
-        let key = self.catalog_key(&name);
-        let sealed = self
-            .master
-            .derive_key("catalog")
-            .seal(&codec::encode_schema(&schema), &key);
-        self.storage.put(&key, &sealed)?;
+        self.store_schema(&schema)?;
         Ok(QueryResult::Created(name))
+    }
+
+    fn create_index(&mut self, table: &str, column: &str) -> Result<QueryResult> {
+        let mut schema = self.expect_schema(table)?;
+        let col = schema.column_index(column).ok_or_else(|| {
+            EngineError::Schema(format!("unknown column {column:?} in table {table:?}"))
+        })?;
+        if schema.columns[col].primary_key {
+            return Err(EngineError::Schema(format!(
+                "column {column:?} is already indexed by PRIMARY KEY"
+            )));
+        }
+        if schema.columns[col].indexed {
+            return Err(EngineError::Schema(format!(
+                "column {column:?} of table {table:?} is already indexed"
+            )));
+        }
+        // Backfill entries for existing rows, then persist the flag.
+        let table_key = self.table_key(table);
+        let mut backfill: Vec<(Value, u64)> = Vec::new();
+        for (key, sealed) in self.storage.scan_prefix(&self.row_prefix(table)) {
+            let row = codec::decode_row(&table_key.open(sealed, key)?)?;
+            if row[col] != Value::Null {
+                backfill.push((row[col].clone(), rowid_from_key(key)));
+            }
+        }
+        for (value, rowid) in backfill {
+            self.put_index_entry(table, &table_key, col, &value, rowid)?;
+        }
+        schema.columns[col].indexed = true;
+        self.store_schema(&schema)?;
+        Ok(QueryResult::IndexCreated {
+            table: table.to_string(),
+            column: column.to_string(),
+        })
+    }
+
+    fn drop_index(&mut self, table: &str, column: &str) -> Result<QueryResult> {
+        let mut schema = self.expect_schema(table)?;
+        let col = schema.column_index(column).ok_or_else(|| {
+            EngineError::Schema(format!("unknown column {column:?} in table {table:?}"))
+        })?;
+        if !schema.columns[col].indexed {
+            return Err(EngineError::Schema(format!(
+                "column {column:?} of table {table:?} is not indexed \
+                 (a PRIMARY KEY index cannot be dropped)"
+            )));
+        }
+        let keys: Vec<Vec<u8>> = self
+            .storage
+            .scan_prefix(&self.index_column_prefix(table, col))
+            .map(|(k, _)| k.to_vec())
+            .collect();
+        for key in keys {
+            self.storage.delete(&key)?;
+        }
+        schema.columns[col].indexed = false;
+        self.store_schema(&schema)?;
+        Ok(QueryResult::IndexDropped {
+            table: table.to_string(),
+            column: column.to_string(),
+        })
     }
 
     fn drop_table(&mut self, name: &str) -> Result<QueryResult> {
@@ -345,12 +418,13 @@ impl Engine {
 
         let table_key = self.table_key(table);
         let pk = pk_column(&schema);
+        let maintained = maintained_columns(&schema);
 
         // Validate the whole batch — types, arity and the primary key —
         // before writing anything, so a rejected INSERT statement never
         // leaves some of its rows behind.
         let mut batch: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
-        let mut batch_pk_keys = std::collections::HashSet::new();
+        let mut batch_pk_prefixes = std::collections::HashSet::new();
         for literals in rows {
             if literals.len() != positions.len() {
                 return Err(EngineError::Type(format!(
@@ -371,8 +445,11 @@ impl Engine {
                         schema.columns[pk_idx].name
                     )));
                 }
-                let duplicate = !batch_pk_keys.insert(self.index_key(table, value))
-                    || self.lookup_pk(table, &table_key, value)?.is_some();
+                let duplicate = !batch_pk_prefixes
+                    .insert(self.index_value_prefix(table, pk_idx, value))
+                    || !self
+                        .index_rowids(table, &table_key, pk_idx, value)?
+                        .is_empty();
                 if duplicate {
                     return Err(EngineError::Constraint(format!(
                         "duplicate value for primary key {:?}",
@@ -389,8 +466,10 @@ impl Engine {
             let key = self.row_key(table, next_id);
             let sealed = table_key.seal(&codec::encode_row(&row), &key);
             self.storage.put(&key, &sealed)?;
-            if let Some(pk_idx) = pk {
-                self.put_index_entry(table, &table_key, &row[pk_idx], next_id)?;
+            for &col in &maintained {
+                if row[col] != Value::Null {
+                    self.put_index_entry(table, &table_key, col, &row[col], next_id)?;
+                }
             }
             next_id += 1;
         }
@@ -542,25 +621,30 @@ impl Engine {
                     changed.len()
                 )));
             }
-            if let Some((key, _, _)) = changed.first()
-                && let Some(existing) = self.lookup_pk(table, &table_key, new_pk)?
-                && existing != rowid_from_key(key)
-            {
-                return Err(EngineError::Constraint(format!(
-                    "duplicate value for primary key {:?}",
-                    schema.columns[pk_idx].name
-                )));
+            if let Some((key, _, _)) = changed.first() {
+                let holders = self.index_rowids(table, &table_key, pk_idx, new_pk)?;
+                if holders.iter().any(|&id| id != rowid_from_key(key)) {
+                    return Err(EngineError::Constraint(format!(
+                        "duplicate value for primary key {:?}",
+                        schema.columns[pk_idx].name
+                    )));
+                }
             }
         }
 
+        let maintained = maintained_columns(&schema);
         let count = changed.len();
         for (key, old_row, new_row) in changed {
-            if let (Some(pk_idx), Some(_)) = (pk, new_pk)
-                && old_row[pk_idx] != new_row[pk_idx]
-            {
-                let old_index_key = self.index_key(table, &old_row[pk_idx]);
-                self.storage.delete(&old_index_key)?;
-                self.put_index_entry(table, &table_key, &new_row[pk_idx], rowid_from_key(&key))?;
+            let rowid = rowid_from_key(&key);
+            for &col in &maintained {
+                if old_row[col] != new_row[col] {
+                    if old_row[col] != Value::Null {
+                        self.delete_index_entry(table, col, &old_row[col], rowid)?;
+                    }
+                    if new_row[col] != Value::Null {
+                        self.put_index_entry(table, &table_key, col, &new_row[col], rowid)?;
+                    }
+                }
             }
             let sealed = table_key.seal(&codec::encode_row(&new_row), &key);
             self.storage.put(&key, &sealed)?;
@@ -573,7 +657,7 @@ impl Engine {
         let filter = predicate.map(|p| compile_expr(&schema, p)).transpose()?;
         let table_key = self.table_key(table);
 
-        let pk = pk_column(&schema);
+        let maintained = maintained_columns(&schema);
         let mut doomed: Vec<(Vec<u8>, Vec<Value>)> = Vec::new();
         for (key, row) in self.candidate_rows(table, &schema, filter.as_ref(), &table_key)? {
             let matches = match &filter {
@@ -586,9 +670,11 @@ impl Engine {
         }
         let count = doomed.len();
         for (key, row) in doomed {
-            if let Some(pk_idx) = pk {
-                let index_key = self.index_key(table, &row[pk_idx]);
-                self.storage.delete(&index_key)?;
+            let rowid = rowid_from_key(&key);
+            for &col in &maintained {
+                if row[col] != Value::Null {
+                    self.delete_index_entry(table, col, &row[col], rowid)?;
+                }
             }
             self.storage.delete(&key)?;
         }
@@ -637,49 +723,79 @@ impl Engine {
         prefix
     }
 
-    /// Index entry key for a primary-key value: the value never appears
-    /// in the key, only its keyed tag (equality leakage only).
-    fn index_key(&self, table: &str, value: &Value) -> Vec<u8> {
-        let encoded = codec::encode_row(std::slice::from_ref(value));
-        let value_tag = self.master.keyed_tag(&format!("pk:{table}"), &encoded);
-        let mut key = self.index_prefix(table);
-        key.extend_from_slice(&value_tag[..TABLE_TAG_LEN]);
-        key
+    /// Prefix of all index entries for one column of a table.
+    fn index_column_prefix(&self, table: &str, col: usize) -> Vec<u8> {
+        let mut prefix = self.index_prefix(table);
+        prefix.extend_from_slice(&(col as u16).to_be_bytes());
+        prefix
     }
 
-    /// Look up the row id holding `value` in the primary-key index.
-    fn lookup_pk(&self, table: &str, table_key: &CipherKey, value: &Value) -> Result<Option<u64>> {
-        let key = self.index_key(table, value);
-        match self.storage.get(&key) {
-            None => Ok(None),
-            Some(sealed) => {
-                let plain = table_key.open(sealed, &key)?;
-                let bytes: [u8; 8] = plain
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| EngineError::Corrupt(format!("bad index entry for {table:?}")))?;
-                Ok(Some(u64::from_le_bytes(bytes)))
-            }
+    /// Prefix of the index entries for one column *value*: the value
+    /// never appears in the key, only its keyed tag (equality leakage
+    /// only). The row id is appended to form the full entry key, so a
+    /// non-unique column simply has several entries under this prefix.
+    fn index_value_prefix(&self, table: &str, col: usize, value: &Value) -> Vec<u8> {
+        let encoded = codec::encode_row(std::slice::from_ref(value));
+        let value_tag = self
+            .master
+            .keyed_tag(&format!("index:{table}:{col}"), &encoded);
+        let mut prefix = self.index_column_prefix(table, col);
+        prefix.extend_from_slice(&value_tag[..TABLE_TAG_LEN]);
+        prefix
+    }
+
+    /// Row ids holding `value` in column `col`, via the equality index.
+    /// Every entry's sealed marker is verified, so tampered or misplaced
+    /// entries fail instead of steering queries to wrong rows.
+    fn index_rowids(
+        &self,
+        table: &str,
+        table_key: &CipherKey,
+        col: usize,
+        value: &Value,
+    ) -> Result<Vec<u64>> {
+        let prefix = self.index_value_prefix(table, col, value);
+        let mut rowids = Vec::new();
+        for (key, sealed) in self.storage.scan_prefix(&prefix) {
+            table_key.open(sealed, key)?;
+            rowids.push(rowid_from_key(key));
         }
+        Ok(rowids)
     }
 
     fn put_index_entry(
         &mut self,
         table: &str,
         table_key: &CipherKey,
+        col: usize,
         value: &Value,
         rowid: u64,
     ) -> Result<()> {
-        let key = self.index_key(table, value);
-        let sealed = table_key.seal(&rowid.to_le_bytes(), &key);
+        let mut key = self.index_value_prefix(table, col, value);
+        key.extend_from_slice(&rowid.to_be_bytes());
+        let sealed = table_key.seal(b"", &key);
         self.storage.put(&key, &sealed)?;
         Ok(())
     }
 
+    fn delete_index_entry(
+        &mut self,
+        table: &str,
+        col: usize,
+        value: &Value,
+        rowid: u64,
+    ) -> Result<()> {
+        let mut key = self.index_value_prefix(table, col, value);
+        key.extend_from_slice(&rowid.to_be_bytes());
+        self.storage.delete(&key)?;
+        Ok(())
+    }
+
     /// Fetch the rows a filtered operation must consider. When the
-    /// predicate pins the primary key to a value (a `pk = literal`
-    /// conjunct), this is a single index lookup instead of a full scan.
-    /// Callers still apply the complete predicate to what is returned.
+    /// predicate pins an indexed column to a value (an `col = literal`
+    /// conjunct on the primary key or a `CREATE INDEX` column), this is
+    /// an index lookup instead of a full scan. Callers still apply the
+    /// complete predicate to what is returned.
     fn candidate_rows(
         &self,
         table: &str,
@@ -687,25 +803,23 @@ impl Engine {
         filter: Option<&CompiledExpr>,
         table_key: &CipherKey,
     ) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
-        if let Some(pk_idx) = pk_column(schema)
-            && let Some(filter) = filter
-            && let Some(value) = pk_eq_value(filter, pk_idx)
+        if let Some(filter) = filter
+            && let Some((col, value)) = indexed_eq_value(filter, schema)
         {
-            return match self.lookup_pk(table, table_key, value)? {
-                None => Ok(Vec::new()),
-                Some(rowid) => {
-                    let key = self.row_key(table, rowid);
-                    match self.storage.get(&key) {
-                        // A dangling index entry (crash between the two
-                        // writes) reads as absent.
-                        None => Ok(Vec::new()),
-                        Some(sealed) => {
-                            let row = codec::decode_row(&table_key.open(sealed, &key)?)?;
-                            Ok(vec![(key, row)])
-                        }
+            let mut rows = Vec::new();
+            for rowid in self.index_rowids(table, table_key, col, value)? {
+                let key = self.row_key(table, rowid);
+                match self.storage.get(&key) {
+                    // A dangling index entry (crash between the two
+                    // writes) reads as absent.
+                    None => continue,
+                    Some(sealed) => {
+                        let row = codec::decode_row(&table_key.open(sealed, &key)?)?;
+                        rows.push((key, row));
                     }
                 }
-            };
+            }
+            return Ok(rows);
         }
         let mut rows = Vec::new();
         for (key, sealed) in self.storage.scan_prefix(&self.row_prefix(table)) {
@@ -715,6 +829,17 @@ impl Engine {
             ));
         }
         Ok(rows)
+    }
+
+    /// Seal and store a schema in the catalog.
+    fn store_schema(&mut self, schema: &TableSchema) -> Result<()> {
+        let key = self.catalog_key(&schema.name);
+        let sealed = self
+            .master
+            .derive_key("catalog")
+            .seal(&codec::encode_schema(schema), &key);
+        self.storage.put(&key, &sealed)?;
+        Ok(())
     }
 
     /// Big-endian row id so lexicographic key order equals insertion order.
@@ -757,21 +882,52 @@ fn rowid_from_key(key: &[u8]) -> u64 {
     u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap())
 }
 
-/// If the expression can only be true when the primary key equals one
-/// specific value, return that value. Only `pk = literal` itself and
+/// Columns whose index entries must be maintained on every mutation:
+/// the primary key plus all `CREATE INDEX` columns.
+fn maintained_columns(schema: &TableSchema) -> Vec<usize> {
+    schema
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.primary_key || c.indexed)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// If the expression can only be true when column `col` equals one
+/// specific value, return that value. Only `col = literal` itself and
 /// AND-conjuncts containing it qualify; anything under OR/NOT does not
-/// pin the key.
-fn pk_eq_value(expr: &CompiledExpr, pk_index: usize) -> Option<&Value> {
+/// pin the column.
+fn eq_value_for(expr: &CompiledExpr, col: usize) -> Option<&Value> {
     match expr {
         CompiledExpr::Compare {
             column_index,
             op: CmpOp::Eq,
             value,
             ..
-        } if *column_index == pk_index && *value != Value::Null => Some(value),
-        CompiledExpr::And(a, b) => pk_eq_value(a, pk_index).or_else(|| pk_eq_value(b, pk_index)),
+        } if *column_index == col && *value != Value::Null => Some(value),
+        CompiledExpr::And(a, b) => eq_value_for(a, col).or_else(|| eq_value_for(b, col)),
         _ => None,
     }
+}
+
+/// Pick the best index for a predicate: the primary key if it is pinned
+/// (at most one row), otherwise any pinned `CREATE INDEX` column.
+fn indexed_eq_value<'a>(
+    expr: &'a CompiledExpr,
+    schema: &TableSchema,
+) -> Option<(usize, &'a Value)> {
+    if let Some(pk) = pk_column(schema)
+        && let Some(value) = eq_value_for(expr, pk)
+    {
+        return Some((pk, value));
+    }
+    schema
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.indexed)
+        .find_map(|(col, _)| eq_value_for(expr, col).map(|value| (col, value)))
 }
 
 /// Parse the keyparams file: `magic (8) | iterations (4 LE) | salt`.
@@ -1217,6 +1373,91 @@ mod tests {
         db.execute("DROP TABLE t").unwrap();
         db.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
         db.execute("INSERT INTO t VALUES (1), (2), (10)").unwrap();
+    }
+
+    #[test]
+    fn secondary_index_full_lifecycle() {
+        let dir = ciphra_testutil::tempdir();
+        let mut db = engine(dir.path());
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, grp TEXT, note TEXT)")
+            .unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (1, 'a', 'x'), (2, 'b', 'y'), (3, 'a', 'z'), \
+             (4, NULL, 'w')",
+        )
+        .unwrap();
+
+        // CREATE INDEX backfills existing rows (non-unique values included).
+        db.execute("CREATE INDEX ON t (grp)").unwrap();
+        let rows = rows_of(db.execute("SELECT id FROM t WHERE grp = 'a'").unwrap());
+        assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(3)]]);
+
+        // Maintained on INSERT...
+        db.execute("INSERT INTO t VALUES (5, 'a', 'v')").unwrap();
+        let rows = rows_of(db.execute("SELECT id FROM t WHERE grp = 'a'").unwrap());
+        assert_eq!(rows.len(), 3);
+        // ...UPDATE (old value released, new value found; NULL clears)...
+        db.execute("UPDATE t SET grp = 'b' WHERE id = 1").unwrap();
+        let rows = rows_of(db.execute("SELECT id FROM t WHERE grp = 'b'").unwrap());
+        assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+        db.execute("UPDATE t SET grp = NULL WHERE id = 2").unwrap();
+        let rows = rows_of(db.execute("SELECT id FROM t WHERE grp = 'b'").unwrap());
+        assert_eq!(rows, vec![vec![Value::Int(1)]]);
+        // ...and DELETE.
+        db.execute("DELETE FROM t WHERE id = 3").unwrap();
+        let rows = rows_of(db.execute("SELECT id FROM t WHERE grp = 'a'").unwrap());
+        assert_eq!(rows, vec![vec![Value::Int(5)]]);
+
+        // The full predicate still applies on top of the index hit.
+        let rows = rows_of(
+            db.execute("SELECT id FROM t WHERE grp = 'a' AND note = 'nope'")
+                .unwrap(),
+        );
+        assert_eq!(rows, Vec::<Vec<Value>>::new());
+        // IS NULL is not served by the index and still works.
+        let rows = rows_of(db.execute("SELECT id FROM t WHERE grp IS NULL").unwrap());
+        assert_eq!(rows, vec![vec![Value::Int(2)], vec![Value::Int(4)]]);
+
+        // Survives reopen.
+        drop(db);
+        let mut db = engine(dir.path());
+        let rows = rows_of(db.execute("SELECT id FROM t WHERE grp = 'a'").unwrap());
+        assert_eq!(rows, vec![vec![Value::Int(5)]]);
+
+        // DROP INDEX: results identical via fallback scan.
+        db.execute("DROP INDEX ON t (grp)").unwrap();
+        let rows = rows_of(db.execute("SELECT id FROM t WHERE grp = 'a'").unwrap());
+        assert_eq!(rows, vec![vec![Value::Int(5)]]);
+    }
+
+    #[test]
+    fn index_ddl_errors() {
+        let dir = ciphra_testutil::tempdir();
+        let mut db = engine(dir.path());
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, grp TEXT)")
+            .unwrap();
+        assert!(matches!(
+            db.execute("CREATE INDEX ON t (id)"),
+            Err(EngineError::Schema(_)) // already indexed by PRIMARY KEY
+        ));
+        assert!(matches!(
+            db.execute("CREATE INDEX ON t (nope)"),
+            Err(EngineError::Schema(_))
+        ));
+        assert!(matches!(
+            db.execute("CREATE INDEX ON missing (grp)"),
+            Err(EngineError::Schema(_))
+        ));
+        db.execute("CREATE INDEX ON t (grp)").unwrap();
+        assert!(matches!(
+            db.execute("CREATE INDEX ON t (grp)"),
+            Err(EngineError::Schema(_)) // duplicate index
+        ));
+        db.execute("DROP INDEX ON t (grp)").unwrap();
+        assert!(matches!(
+            db.execute("DROP INDEX ON t (grp)"),
+            Err(EngineError::Schema(_)) // not indexed
+        ));
     }
 
     #[test]

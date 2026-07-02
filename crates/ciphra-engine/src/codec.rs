@@ -27,6 +27,7 @@ impl TableSchema {
 
 const FLAG_ENCRYPTED: u8 = 1 << 0;
 const FLAG_PRIMARY_KEY: u8 = 1 << 1;
+const FLAG_INDEXED: u8 = 1 << 2;
 
 /// Schema layout: `version (1) | name_len (2 LE) | name | ncols (2 LE)`
 /// then per column: `flags (1) | type (1) | name_len (2 LE) | name`.
@@ -42,6 +43,9 @@ pub fn encode_schema(schema: &TableSchema) -> Vec<u8> {
         }
         if col.primary_key {
             flags |= FLAG_PRIMARY_KEY;
+        }
+        if col.indexed {
+            flags |= FLAG_INDEXED;
         }
         out.push(flags);
         out.push(match col.ty {
@@ -78,6 +82,7 @@ pub fn decode_schema(buf: &[u8]) -> Result<TableSchema> {
         let flags = buf[pos];
         let encrypted = flags & FLAG_ENCRYPTED != 0;
         let primary_key = flags & FLAG_PRIMARY_KEY != 0;
+        let indexed = flags & FLAG_INDEXED != 0;
         let ty = match buf[pos + 1] {
             TAG_INT => DataType::Int,
             TAG_TEXT => DataType::Text,
@@ -97,6 +102,7 @@ pub fn decode_schema(buf: &[u8]) -> Result<TableSchema> {
             ty,
             encrypted,
             primary_key,
+            indexed,
         });
     }
     if pos != buf.len() {
@@ -185,12 +191,14 @@ mod tests {
                     ty: DataType::Int,
                     encrypted: false,
                     primary_key: true,
+                    indexed: false,
                 },
                 ColumnDef {
                     name: "ssn".into(),
                     ty: DataType::Text,
                     encrypted: true,
                     primary_key: false,
+                    indexed: true,
                 },
             ],
         };

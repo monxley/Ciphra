@@ -23,7 +23,8 @@ later.
       on disk at all)
 - [x] Primary keys: uniqueness + non-NULL enforcement, point lookups
       through an encrypted equality index (keyed value tags)
-- [ ] Secondary indexes (`CREATE INDEX`) over sealed values
+- [x] Secondary indexes: `CREATE INDEX` / `DROP INDEX` with backfill,
+      unified entry format with the PK index, opt-in equality leakage
 - [ ] Argon2id as the default KDF (memory-hard; PBKDF2 kept for compat)
 - [ ] Key rotation: re-seal a table under a new master
 - [ ] `EXPLAIN`, basic statistics
