@@ -39,9 +39,12 @@
 //! unique among live rows, so their tags repeat only across
 //! delete/re-insert cycles.
 //!
-//! Multi-key mutations (row + index entry) are not atomic yet: a crash
-//! between the two writes can leave a dangling index entry, which
-//! readers treat as absent. Transactions are on the roadmap.
+//! Every statement commits as a single WAL batch record under one
+//! checksum: one fsync per statement (group commit) and all-or-nothing
+//! crash recovery — a torn statement is dropped whole, never applied
+//! partially. Readers still tolerate a dangling index entry (treated
+//! as absent) as defense in depth for databases written before batch
+//! records. Multi-statement transactions are on the roadmap.
 
 mod codec;
 
@@ -55,7 +58,7 @@ use ciphra_crypto::{CipherKey, CryptoError, MasterKey};
 use ciphra_sql::{
     Assignment, CmpOp, Expr, Limit, Literal, OrderBy, ParseError, Projection, Statement,
 };
-use ciphra_storage::{Storage, StorageError};
+use ciphra_storage::{Batch, Storage, StorageError};
 
 /// Legacy sidecar file holding KDF parameters; still read (and migrated
 /// into the WAL) for databases created before the in-WAL record.
@@ -334,20 +337,30 @@ impl Engine {
         }
         let mut fresh = Engine::open_with_kdf(&tmp, new_passphrase, kdf)?;
         for (schema, seq, rows) in snapshot {
-            fresh.store_schema(&schema)?;
+            // One batch (one fsync) per table.
+            let mut writes = Batch::new();
+            fresh.add_schema(&mut writes, &schema);
             let table_key = fresh.table_key(&schema.name);
-            fresh.store_seq(&schema.name, &table_key, seq)?;
+            fresh.add_seq(&mut writes, &schema.name, &table_key, seq);
             let maintained = maintained_columns(&schema);
             for (rowid, row) in rows {
                 let key = fresh.row_key(&schema.name, rowid);
                 let sealed = table_key.seal(&codec::encode_row(&row), &key);
-                fresh.storage.put(&key, &sealed)?;
+                writes.put(&key, &sealed);
                 for &col in &maintained {
                     if row[col] != Value::Null {
-                        fresh.put_index_entry(&schema.name, &table_key, col, &row[col], rowid)?;
+                        fresh.add_index_entry(
+                            &mut writes,
+                            &schema.name,
+                            &table_key,
+                            col,
+                            &row[col],
+                            rowid,
+                        );
                     }
                 }
             }
+            fresh.storage.commit(writes)?;
         }
         drop(fresh);
 
@@ -523,7 +536,9 @@ impl Engine {
             name: name.clone(),
             columns,
         };
-        self.store_schema(&schema)?;
+        let mut batch = Batch::new();
+        self.add_schema(&mut batch, &schema);
+        self.storage.commit(batch)?;
         Ok(QueryResult::Created(name))
     }
 
@@ -542,20 +557,26 @@ impl Engine {
                 "column {column:?} of table {table:?} is already indexed"
             )));
         }
-        // Backfill entries for existing rows, then persist the flag.
+        // Backfill entries for existing rows and flip the schema flag in
+        // one committed batch: the index either exists fully or not at all.
         let table_key = self.table_key(table);
-        let mut backfill: Vec<(Value, u64)> = Vec::new();
+        let mut batch = Batch::new();
         for (key, sealed) in self.storage.scan_prefix(&self.row_prefix(table)) {
             let row = codec::decode_row(&table_key.open(sealed, key)?)?;
             if row[col] != Value::Null {
-                backfill.push((row[col].clone(), rowid_from_key(key)));
+                self.add_index_entry(
+                    &mut batch,
+                    table,
+                    &table_key,
+                    col,
+                    &row[col],
+                    rowid_from_key(key),
+                );
             }
         }
-        for (value, rowid) in backfill {
-            self.put_index_entry(table, &table_key, col, &value, rowid)?;
-        }
         schema.columns[col].indexed = true;
-        self.store_schema(&schema)?;
+        self.add_schema(&mut batch, &schema);
+        self.storage.commit(batch)?;
         Ok(QueryResult::IndexCreated {
             table: table.to_string(),
             column: column.to_string(),
@@ -573,16 +594,16 @@ impl Engine {
                  (a PRIMARY KEY index cannot be dropped)"
             )));
         }
-        let keys: Vec<Vec<u8>> = self
+        let mut batch = Batch::new();
+        for (key, _) in self
             .storage
             .scan_prefix(&self.index_column_prefix(table, col))
-            .map(|(k, _)| k.to_vec())
-            .collect();
-        for key in keys {
-            self.storage.delete(&key)?;
+        {
+            batch.delete(key);
         }
         schema.columns[col].indexed = false;
-        self.store_schema(&schema)?;
+        self.add_schema(&mut batch, &schema);
+        self.storage.commit(batch)?;
         Ok(QueryResult::IndexDropped {
             table: table.to_string(),
             column: column.to_string(),
@@ -591,20 +612,15 @@ impl Engine {
 
     fn drop_table(&mut self, name: &str) -> Result<QueryResult> {
         self.expect_schema(name)?;
+        let mut batch = Batch::new();
         for prefix in [self.row_prefix(name), self.index_prefix(name)] {
-            let keys: Vec<Vec<u8>> = self
-                .storage
-                .scan_prefix(&prefix)
-                .map(|(k, _)| k.to_vec())
-                .collect();
-            for key in keys {
-                self.storage.delete(&key)?;
+            for (key, _) in self.storage.scan_prefix(&prefix) {
+                batch.delete(key);
             }
         }
-        let seq = self.seq_key(name);
-        self.storage.delete(&seq)?;
-        let catalog = self.catalog_key(name);
-        self.storage.delete(&catalog)?;
+        batch.delete(&self.seq_key(name));
+        batch.delete(&self.catalog_key(name));
+        self.storage.commit(batch)?;
         Ok(QueryResult::Dropped(name.to_string()))
     }
 
@@ -673,20 +689,24 @@ impl Engine {
             batch.push(row);
         }
 
+        // One WAL record and one fsync for the whole statement: rows,
+        // index entries and the sequence land atomically together.
         let mut next_id = self.load_seq(table, &table_key)?;
         let count = batch.len();
+        let mut writes = Batch::new();
         for row in batch {
             let key = self.row_key(table, next_id);
             let sealed = table_key.seal(&codec::encode_row(&row), &key);
-            self.storage.put(&key, &sealed)?;
+            writes.put(&key, &sealed);
             for &col in &maintained {
                 if row[col] != Value::Null {
-                    self.put_index_entry(table, &table_key, col, &row[col], next_id)?;
+                    self.add_index_entry(&mut writes, table, &table_key, col, &row[col], next_id);
                 }
             }
             next_id += 1;
         }
-        self.store_seq(table, &table_key, next_id)?;
+        self.add_seq(&mut writes, table, &table_key, next_id);
+        self.storage.commit(writes)?;
         Ok(QueryResult::Inserted(count))
     }
 
@@ -847,21 +867,30 @@ impl Engine {
 
         let maintained = maintained_columns(&schema);
         let count = changed.len();
+        let mut writes = Batch::new();
         for (key, old_row, new_row) in changed {
             let rowid = rowid_from_key(&key);
             for &col in &maintained {
                 if old_row[col] != new_row[col] {
                     if old_row[col] != Value::Null {
-                        self.delete_index_entry(table, col, &old_row[col], rowid)?;
+                        self.remove_index_entry(&mut writes, table, col, &old_row[col], rowid);
                     }
                     if new_row[col] != Value::Null {
-                        self.put_index_entry(table, &table_key, col, &new_row[col], rowid)?;
+                        self.add_index_entry(
+                            &mut writes,
+                            table,
+                            &table_key,
+                            col,
+                            &new_row[col],
+                            rowid,
+                        );
                     }
                 }
             }
             let sealed = table_key.seal(&codec::encode_row(&new_row), &key);
-            self.storage.put(&key, &sealed)?;
+            writes.put(&key, &sealed);
         }
+        self.storage.commit(writes)?;
         Ok(QueryResult::Updated(count))
     }
 
@@ -882,15 +911,17 @@ impl Engine {
             }
         }
         let count = doomed.len();
+        let mut writes = Batch::new();
         for (key, row) in doomed {
             let rowid = rowid_from_key(&key);
             for &col in &maintained {
                 if row[col] != Value::Null {
-                    self.delete_index_entry(table, col, &row[col], rowid)?;
+                    self.remove_index_entry(&mut writes, table, col, &row[col], rowid);
                 }
             }
-            self.storage.delete(&key)?;
+            writes.delete(&key);
         }
+        self.storage.commit(writes)?;
         Ok(QueryResult::Deleted(count))
     }
 
@@ -976,32 +1007,32 @@ impl Engine {
         Ok(rowids)
     }
 
-    fn put_index_entry(
-        &mut self,
+    fn add_index_entry(
+        &self,
+        batch: &mut Batch,
         table: &str,
         table_key: &CipherKey,
         col: usize,
         value: &Value,
         rowid: u64,
-    ) -> Result<()> {
+    ) {
         let mut key = self.index_value_prefix(table, col, value);
         key.extend_from_slice(&rowid.to_be_bytes());
         let sealed = table_key.seal(b"", &key);
-        self.storage.put(&key, &sealed)?;
-        Ok(())
+        batch.put(&key, &sealed);
     }
 
-    fn delete_index_entry(
-        &mut self,
+    fn remove_index_entry(
+        &self,
+        batch: &mut Batch,
         table: &str,
         col: usize,
         value: &Value,
         rowid: u64,
-    ) -> Result<()> {
+    ) {
         let mut key = self.index_value_prefix(table, col, value);
         key.extend_from_slice(&rowid.to_be_bytes());
-        self.storage.delete(&key)?;
-        Ok(())
+        batch.delete(&key);
     }
 
     /// Fetch the rows a filtered operation must consider. When the
@@ -1044,15 +1075,14 @@ impl Engine {
         Ok(rows)
     }
 
-    /// Seal and store a schema in the catalog.
-    fn store_schema(&mut self, schema: &TableSchema) -> Result<()> {
+    /// Seal a schema into the batch's catalog entry.
+    fn add_schema(&self, batch: &mut Batch, schema: &TableSchema) {
         let key = self.catalog_key(&schema.name);
         let sealed = self
             .master
             .derive_key("catalog")
             .seal(&codec::encode_schema(schema), &key);
-        self.storage.put(&key, &sealed)?;
-        Ok(())
+        batch.put(&key, &sealed);
     }
 
     /// Big-endian row id so lexicographic key order equals insertion order.
@@ -1077,11 +1107,10 @@ impl Engine {
         }
     }
 
-    fn store_seq(&mut self, table: &str, table_key: &CipherKey, next: u64) -> Result<()> {
+    fn add_seq(&self, batch: &mut Batch, table: &str, table_key: &CipherKey, next: u64) {
         let key = self.seq_key(table);
         let sealed = table_key.seal(&next.to_le_bytes(), &key);
-        self.storage.put(&key, &sealed)?;
-        Ok(())
+        batch.put(&key, &sealed);
     }
 }
 

@@ -1,7 +1,8 @@
 //! Ciphra micro-benchmarks. Run with `cargo run --release -p ciphra-bench`.
 //!
 //! Every number includes the full cost of the encryption model: whole-row
-//! ChaCha20-Poly1305, keyed index tags, and one fsync per storage write.
+//! ChaCha20-Poly1305, keyed index tags, and one durable fsync per statement
+//! (group commit).
 //! There is deliberately no "fast mode" — the encrypted path is the only
 //! path. Compare against SQLite with `scripts/bench-vs-sqlite.sh` on a
 //! machine that has the `sqlite3` CLI.
@@ -34,7 +35,7 @@ fn main() {
     )
     .unwrap();
 
-    println!("ciphra-bench: {rows} rows, PK + one secondary index, fsync per write");
+    println!("ciphra-bench: {rows} rows, PK + one secondary index, one fsync per statement");
     println!(
         "(one-time) Argon2id open, 19 MiB t=2:      {:>10.1?}",
         kdf_open
