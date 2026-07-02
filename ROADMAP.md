@@ -48,7 +48,9 @@ later.
       statement, committed atomically with its data; `.audit
       root`/`.audit verify`; rollback detection via external roots.
       (Merkle tree for O(log n) inclusion proofs: planned upgrade)
-- [ ] `VECTOR` type + similarity search over encrypted embeddings
+- [x] `VECTOR(dim)` type + `ORDER BY col NEAREST TO [..]` similarity
+      search: exact brute-force cosine over sealed rows (sealed-blob
+      ANN index for large corpora: planned)
 - [ ] Backup/restore, snapshot export (sealed)
 
 ## Phase 3 — Multi-node and hardening

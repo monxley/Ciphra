@@ -8,8 +8,12 @@ pub(crate) enum Token {
     /// case-insensitively). Stored lowercased.
     Ident(String),
     Int(i64),
+    /// Floating-point literal; only valid inside vector literals.
+    Float(f64),
     Str(String),
     Comma,
+    LBracket,
+    RBracket,
     LParen,
     RParen,
     Star,
@@ -28,8 +32,11 @@ impl std::fmt::Display for Token {
         match self {
             Token::Ident(s) => write!(f, "{s}"),
             Token::Int(n) => write!(f, "{n}"),
+            Token::Float(x) => write!(f, "{x}"),
             Token::Str(s) => write!(f, "'{s}'"),
             Token::Comma => write!(f, ","),
+            Token::LBracket => write!(f, "["),
+            Token::RBracket => write!(f, "]"),
             Token::LParen => write!(f, "("),
             Token::RParen => write!(f, ")"),
             Token::Star => write!(f, "*"),
@@ -64,6 +71,14 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
             }
             b',' => {
                 tokens.push(Token::Comma);
+                i += 1;
+            }
+            b'[' => {
+                tokens.push(Token::LBracket);
+                i += 1;
+            }
+            b']' => {
+                tokens.push(Token::RBracket);
                 i += 1;
             }
             b'(' => {
@@ -131,11 +146,24 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                 while i < bytes.len() && bytes[i].is_ascii_digit() {
                     i += 1;
                 }
-                let text = &input[start..i];
-                let n: i64 = text
-                    .parse()
-                    .map_err(|_| ParseError(format!("integer literal out of range: {text}")))?;
-                tokens.push(Token::Int(n));
+                // A dot followed by a digit makes it a float literal.
+                if i + 1 < bytes.len() && bytes[i] == b'.' && bytes[i + 1].is_ascii_digit() {
+                    i += 1;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    let text = &input[start..i];
+                    let x: f64 = text
+                        .parse()
+                        .map_err(|_| ParseError(format!("bad float literal: {text}")))?;
+                    tokens.push(Token::Float(x));
+                } else {
+                    let text = &input[start..i];
+                    let n: i64 = text
+                        .parse()
+                        .map_err(|_| ParseError(format!("integer literal out of range: {text}")))?;
+                    tokens.push(Token::Int(n));
+                }
             }
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
                 let start = i;

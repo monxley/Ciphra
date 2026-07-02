@@ -11,6 +11,7 @@ const SCHEMA_VERSION: u8 = 2;
 const TAG_NULL: u8 = 0;
 const TAG_INT: u8 = 1;
 const TAG_TEXT: u8 = 2;
+const TAG_VECTOR: u8 = 3;
 
 /// Table schema as stored in the catalog.
 #[derive(Debug, Clone, PartialEq)]
@@ -52,10 +53,14 @@ pub fn encode_schema(schema: &TableSchema) -> Vec<u8> {
             flags |= FLAG_RANGE_INDEXED;
         }
         out.push(flags);
-        out.push(match col.ty {
-            DataType::Int => TAG_INT,
-            DataType::Text => TAG_TEXT,
-        });
+        match col.ty {
+            DataType::Int => out.push(TAG_INT),
+            DataType::Text => out.push(TAG_TEXT),
+            DataType::Vector(dim) => {
+                out.push(TAG_VECTOR);
+                out.extend_from_slice(&dim.to_le_bytes());
+            }
+        }
         out.extend_from_slice(&(col.name.len() as u16).to_le_bytes());
         out.extend_from_slice(col.name.as_bytes());
     }
@@ -88,13 +93,22 @@ pub fn decode_schema(buf: &[u8]) -> Result<TableSchema> {
         let primary_key = flags & FLAG_PRIMARY_KEY != 0;
         let indexed = flags & FLAG_INDEXED != 0;
         let range_indexed = flags & FLAG_RANGE_INDEXED != 0;
+        let mut extra = 0usize;
         let ty = match buf[pos + 1] {
             TAG_INT => DataType::Int,
             TAG_TEXT => DataType::Text,
+            TAG_VECTOR => {
+                if buf.len() < pos + 6 {
+                    return Err(corrupt());
+                }
+                extra = 2;
+                DataType::Vector(u16::from_le_bytes([buf[pos + 2], buf[pos + 3]]))
+            }
             _ => return Err(corrupt()),
         };
-        let col_name_len = u16::from_le_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
-        pos += 4;
+        let col_name_len =
+            u16::from_le_bytes([buf[pos + 2 + extra], buf[pos + 3 + extra]]) as usize;
+        pos += 4 + extra;
         if buf.len() < pos + col_name_len {
             return Err(corrupt());
         }
@@ -133,6 +147,13 @@ pub fn encode_row(values: &[Value]) -> Vec<u8> {
                 out.push(TAG_TEXT);
                 out.extend_from_slice(&(s.len() as u32).to_le_bytes());
                 out.extend_from_slice(s.as_bytes());
+            }
+            Value::Vector(v) => {
+                out.push(TAG_VECTOR);
+                out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                for x in v {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
             }
         }
     }
@@ -173,6 +194,26 @@ pub fn decode_row(buf: &[u8]) -> Result<Vec<Value>> {
                     .map_err(|_| corrupt())?;
                 values.push(Value::Text(text.to_string()));
                 pos += len;
+            }
+            TAG_VECTOR => {
+                let len_bytes: [u8; 4] = buf
+                    .get(pos..pos + 4)
+                    .ok_or_else(corrupt)?
+                    .try_into()
+                    .unwrap();
+                let len = u32::from_le_bytes(len_bytes) as usize;
+                pos += 4;
+                let mut v = Vec::with_capacity(len);
+                for _ in 0..len {
+                    let bits: [u8; 4] = buf
+                        .get(pos..pos + 4)
+                        .ok_or_else(corrupt)?
+                        .try_into()
+                        .unwrap();
+                    v.push(f32::from_le_bytes(bits));
+                    pos += 4;
+                }
+                values.push(Value::Vector(v));
             }
             _ => return Err(corrupt()),
         }
@@ -270,6 +311,7 @@ mod tests {
             Value::Null,
             Value::Text("héllo 'world'".into()),
             Value::Int(i64::MAX),
+            Value::Vector(vec![0.25, -1.5, 3.0]),
         ];
         assert_eq!(decode_row(&encode_row(&row)).unwrap(), row);
     }
