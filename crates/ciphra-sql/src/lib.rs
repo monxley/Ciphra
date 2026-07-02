@@ -32,6 +32,16 @@ pub enum Statement {
     DropTable {
         name: String,
     },
+    /// `CREATE INDEX ON table (column)` — an equality index.
+    CreateIndex {
+        table: String,
+        column: String,
+    },
+    /// `DROP INDEX ON table (column)`.
+    DropIndex {
+        table: String,
+        column: String,
+    },
     Insert {
         table: String,
         /// Explicit column list, if given.
@@ -68,6 +78,10 @@ pub struct ColumnDef {
     /// Marked `PRIMARY KEY` in the DDL: unique, non-NULL, and backed by
     /// an equality index for point lookups. At most one per table.
     pub primary_key: bool,
+    /// Has a secondary equality index. Not column DDL syntax — the
+    /// parser always leaves this false; the engine flips it via
+    /// `CREATE INDEX` / `DROP INDEX` and persists it in the catalog.
+    pub indexed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,18 +208,21 @@ mod tests {
                         ty: DataType::Int,
                         encrypted: false,
                         primary_key: true,
+                        indexed: false,
                     },
                     ColumnDef {
                         name: "name".into(),
                         ty: DataType::Text,
                         encrypted: false,
                         primary_key: false,
+                        indexed: false,
                     },
                     ColumnDef {
                         name: "ssn".into(),
                         ty: DataType::Text,
                         encrypted: true,
                         primary_key: false,
+                        indexed: false,
                     },
                 ],
             }
@@ -218,6 +235,27 @@ mod tests {
         assert!(columns[0].encrypted && columns[0].primary_key);
         // PRIMARY without KEY is an error.
         assert!(parse_statements("CREATE TABLE t (k INT PRIMARY)").is_err());
+    }
+
+    #[test]
+    fn create_and_drop_index() {
+        assert_eq!(
+            one("CREATE INDEX ON users (name)"),
+            Statement::CreateIndex {
+                table: "users".into(),
+                column: "name".into(),
+            }
+        );
+        assert_eq!(
+            one("drop index on users (name);"),
+            Statement::DropIndex {
+                table: "users".into(),
+                column: "name".into(),
+            }
+        );
+        assert!(parse_statements("CREATE INDEX users (name)").is_err());
+        assert!(parse_statements("CREATE INDEX ON users ()").is_err());
+        assert!(parse_statements("CREATE INDEX ON users (a, b)").is_err());
     }
 
     #[test]

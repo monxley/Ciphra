@@ -160,6 +160,8 @@ fn meta_command(engine: &mut Engine, command: &str) -> bool {
         ORDER BY id DESC LIMIT 10 OFFSET 5;
     UPDATE t SET name = 'robert' WHERE id = 2;
     DELETE FROM t WHERE name = 'bob';
+    CREATE INDEX ON t (name);
+    DROP INDEX ON t (name);
     DROP TABLE t;
 
 All rows are ChaCha20-Poly1305 encrypted before they reach disk."
@@ -186,7 +188,8 @@ All rows are ChaCha20-Poly1305 encrypted before they reach disk."
                         };
                         let pk = if col.primary_key { " PRIMARY KEY" } else { "" };
                         let enc = if col.encrypted { " ENCRYPTED" } else { "" };
-                        println!("{} {ty}{pk}{enc}", col.name);
+                        let idx = if col.indexed { " INDEXED" } else { "" };
+                        println!("{} {ty}{pk}{enc}{idx}", col.name);
                     }
                 }
                 Err(e) => eprintln!("{e}"),
@@ -209,6 +212,12 @@ fn print_result(result: &QueryResult) {
     match result {
         QueryResult::Created(name) => println!("created table {name}"),
         QueryResult::Dropped(name) => println!("dropped table {name}"),
+        QueryResult::IndexCreated { table, column } => {
+            println!("created index on {table} ({column})")
+        }
+        QueryResult::IndexDropped { table, column } => {
+            println!("dropped index on {table} ({column})")
+        }
         QueryResult::Inserted(n) => println!("inserted {n} row{}", plural(*n)),
         QueryResult::Updated(n) => println!("updated {n} row{}", plural(*n)),
         QueryResult::Deleted(n) => println!("deleted {n} row{}", plural(*n)),

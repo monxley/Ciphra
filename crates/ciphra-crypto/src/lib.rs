@@ -3,12 +3,14 @@
 //! Everything here is implemented in this crate from the primary
 //! specifications and verified against official test vectors:
 //! SHA-256 (FIPS 180-4), HMAC (RFC 2104), HKDF (RFC 5869),
-//! PBKDF2 (RFC 8018), ChaCha20-Poly1305 (RFC 8439).
+//! PBKDF2 (RFC 8018), ChaCha20-Poly1305 (RFC 8439),
+//! BLAKE2b (RFC 7693), Argon2id (RFC 9106).
 //!
 //! Key hierarchy:
 //!
 //! ```text
-//! passphrase ── PBKDF2-HMAC-SHA256(salt, iters) ──► MasterKey (never stored)
+//! passphrase ── Argon2id(salt, m, t, p) ─────────► MasterKey (never stored)
+//!               (or PBKDF2-HMAC-SHA256, legacy)
 //! MasterKey  ── HKDF-SHA256(context) ────────────► CipherKey per table/purpose
 //! CipherKey  ── ChaCha20-Poly1305(nonce, AAD) ───► sealed envelope
 //! ```
@@ -24,12 +26,16 @@
 //! upgrades (Argon2id, queryable encryption, audited implementations).
 
 mod aead;
+mod argon2;
+mod blake2b;
 mod chacha20;
 mod hmac;
 mod poly1305;
 mod rand;
 mod sha256;
 
+pub use argon2::argon2id;
+pub use blake2b::{Blake2b, blake2b};
 pub use hmac::{hkdf_expand, hkdf_extract, hmac_sha256, pbkdf2_sha256};
 pub use rand::fill_random;
 pub use sha256::{Sha256, sha256};
@@ -42,6 +48,11 @@ pub const TAG_LEN: usize = aead::TAG_LEN;
 /// PBKDF2 work factor used unless the caller picks another one.
 /// OWASP's 2023+ recommendation for PBKDF2-HMAC-SHA256.
 pub const DEFAULT_KDF_ITERATIONS: u32 = 600_000;
+
+/// Default Argon2id parameters (OWASP recommendation: 19 MiB, t=2, p=1).
+pub const DEFAULT_ARGON2_MEMORY_KIB: u32 = 19_456;
+pub const DEFAULT_ARGON2_PASSES: u32 = 2;
+pub const DEFAULT_ARGON2_LANES: u32 = 1;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CryptoError {
@@ -70,9 +81,33 @@ impl MasterKey {
     /// Derive the master key with PBKDF2-HMAC-SHA256.
     /// Use [`random_salt`] for `salt` and persist it; `iterations` is the
     /// work factor (see [`DEFAULT_KDF_ITERATIONS`]).
+    ///
+    /// Kept for databases created before Argon2id became the default;
+    /// prefer [`MasterKey::derive_argon2id`] for new key material.
     pub fn derive_from_passphrase(passphrase: &str, salt: &[u8], iterations: u32) -> Self {
         let mut key = [0u8; KEY_LEN];
         pbkdf2_sha256(passphrase.as_bytes(), salt, iterations, &mut key);
+        MasterKey(key)
+    }
+
+    /// Derive the master key with Argon2id (memory-hard; the default).
+    /// See the `DEFAULT_ARGON2_*` constants for recommended parameters.
+    pub fn derive_argon2id(
+        passphrase: &str,
+        salt: &[u8],
+        memory_kib: u32,
+        passes: u32,
+        lanes: u32,
+    ) -> Self {
+        let mut key = [0u8; KEY_LEN];
+        argon2id(
+            passphrase.as_bytes(),
+            salt,
+            memory_kib,
+            passes,
+            lanes,
+            &mut key,
+        );
         MasterKey(key)
     }
 

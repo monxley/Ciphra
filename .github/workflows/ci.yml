@@ -11,7 +11,10 @@ env:
 jobs:
   check:
     name: fmt + clippy + test
-    runs-on: ubuntu-latest
+    # Hosted runners are unavailable for this account; set the CI_RUNNER
+    # repository variable to "self-hosted" once a runner is registered
+    # (Settings -> Actions -> Runners) and this workflow picks it up.
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
