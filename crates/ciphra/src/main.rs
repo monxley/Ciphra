@@ -107,9 +107,14 @@ ENVIRONMENT:
 REPL COMMANDS:
     .tables              List tables
     .schema <table>      Show a table's schema
+    .audit [root|verify] Show or verify the tamper-evident audit chain
     .help                Show SQL help
     .exit                Quit"
     );
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn repl(engine: &mut Engine, data_dir: &str) {
@@ -189,6 +194,26 @@ fn meta_command(engine: &mut Engine, command: &str) -> bool {
 All rows are ChaCha20-Poly1305 encrypted before they reach disk."
             );
         }
+        ".audit" => match parts.next() {
+            None | Some("root") => {
+                let (seq, root) = engine.audit_root();
+                println!("audit head: seq {seq}, root {}", hex(&root));
+                println!("(record these externally; compare later to detect rollback)");
+            }
+            Some("verify") => match engine.audit_verify() {
+                Ok(entries) => {
+                    let (seq, root) = engine.audit_root();
+                    println!(
+                        "audit chain OK: {} entries verified, root {}",
+                        entries.len(),
+                        hex(&root)
+                    );
+                    let _ = seq;
+                }
+                Err(e) => eprintln!("{e}"),
+            },
+            Some(other) => eprintln!("unknown subcommand: .audit {other} (root|verify)"),
+        },
         ".tables" => match engine.tables() {
             Ok(tables) if tables.is_empty() => println!("(no tables)"),
             Ok(tables) => {

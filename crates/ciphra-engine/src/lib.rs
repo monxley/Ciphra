@@ -70,12 +70,81 @@ const KEYPARAMS_KEY: &[u8] = b"\x00keyparams";
 /// Scratch directory used while rebuilding the database during key
 /// rotation; safe to delete whenever no rotation is running.
 const ROTATE_TMP_DIR: &str = ".rotate-tmp";
+/// Prefix of sealed audit-chain entries: `a\x00<seq u64 BE>`.
+const AUDIT_PREFIX: &[u8] = b"a\x00";
+/// Storage key of the sealed audit head: `seq u64 LE | root (32)`.
+const AUDIT_HEAD_KEY: &[u8] = b"\x00audit";
+/// Fixed size of a serialized audit entry (see [`AuditEntry`]).
+const AUDIT_ENTRY_LEN: usize = 8 + 8 + 1 + 16 + 32 + 32;
+
+/// Statement kinds recorded in the audit chain.
+pub mod audit_kind {
+    pub const CREATE_TABLE: u8 = 1;
+    pub const DROP_TABLE: u8 = 2;
+    pub const CREATE_INDEX: u8 = 3;
+    pub const DROP_INDEX: u8 = 4;
+    pub const INSERT: u8 = 5;
+    pub const UPDATE: u8 = 6;
+    pub const DELETE: u8 = 7;
+    pub const ROTATE: u8 = 8;
+}
 /// v1 layout: `magic | iterations u32 LE | salt` (PBKDF2 implied).
 const KEYPARAMS_MAGIC_V1: &[u8; 8] = b"CIPHRA\x00\x01";
 /// v2 layout: `magic | kdf u8 | params | salt` where kdf 1 = PBKDF2
 /// (`iterations u32`), kdf 2 = Argon2id (`m_kib u32 | passes u32 |
 /// lanes u32`), all LE.
 const KEYPARAMS_MAGIC_V2: &[u8; 8] = b"CIPHRA\x00\x02";
+/// One decoded audit-chain entry.
+///
+/// Deliberately contains no user plaintext: the table is identified by
+/// its opaque tag and the writes by a digest over the *sealed* bytes,
+/// so a published root cannot be used to brute-force secret content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditEntry {
+    pub seq: u64,
+    /// Seconds since the Unix epoch.
+    pub time: u64,
+    pub kind: u8,
+    /// Opaque table tag; zeros for statements without a single table.
+    pub table_tag: [u8; 16],
+    /// SHA-256 over the committed (sealed) writes of the statement.
+    pub writes_digest: [u8; 32],
+    /// The chain root this entry extends.
+    pub prev_root: [u8; 32],
+}
+
+impl AuditEntry {
+    fn encode(&self) -> [u8; AUDIT_ENTRY_LEN] {
+        let mut out = [0u8; AUDIT_ENTRY_LEN];
+        out[..8].copy_from_slice(&self.seq.to_le_bytes());
+        out[8..16].copy_from_slice(&self.time.to_le_bytes());
+        out[16] = self.kind;
+        out[17..33].copy_from_slice(&self.table_tag);
+        out[33..65].copy_from_slice(&self.writes_digest);
+        out[65..97].copy_from_slice(&self.prev_root);
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != AUDIT_ENTRY_LEN {
+            return Err(EngineError::Corrupt("bad audit entry".into()));
+        }
+        Ok(AuditEntry {
+            seq: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            time: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            kind: bytes[16],
+            table_tag: bytes[17..33].try_into().unwrap(),
+            writes_digest: bytes[33..65].try_into().unwrap(),
+            prev_root: bytes[65..97].try_into().unwrap(),
+        })
+    }
+
+    /// The chain root after this entry.
+    fn root(&self) -> [u8; 32] {
+        ciphra_crypto::sha256(&self.encode())
+    }
+}
+
 const KDF_PBKDF2: u8 = 1;
 const KDF_ARGON2ID: u8 = 2;
 const CANARY_KEY: &[u8] = b"\x00canary";
@@ -112,6 +181,8 @@ pub enum EngineError {
     Schema(String),
     /// Constraint violation: duplicate or NULL primary key.
     Constraint(String),
+    /// The audit chain failed verification: history was tampered with.
+    Audit(String),
     /// Value/type mismatch.
     Type(String),
     Corrupt(String),
@@ -127,6 +198,7 @@ impl std::fmt::Display for EngineError {
             EngineError::BadPassphrase => write!(f, "wrong passphrase for this database"),
             EngineError::Schema(msg) => write!(f, "schema error: {msg}"),
             EngineError::Constraint(msg) => write!(f, "constraint violation: {msg}"),
+            EngineError::Audit(msg) => write!(f, "audit chain violation: {msg}"),
             EngineError::Type(msg) => write!(f, "type error: {msg}"),
             EngineError::Corrupt(msg) => write!(f, "corrupt data: {msg}"),
             EngineError::Io(e) => write!(f, "io error: {e}"),
@@ -225,6 +297,8 @@ pub struct Engine {
     storage: Storage,
     master: MasterKey,
     dir: PathBuf,
+    /// Cached audit head: (next sequence number, current chain root).
+    audit_head: (u64, [u8; 32]),
 }
 
 impl Engine {
@@ -298,11 +372,76 @@ impl Engine {
             }
         }
 
+        // Load the audit head; a fresh database starts at the genesis
+        // root (all zeros) with sequence 0.
+        let audit_key = master.derive_key("audit");
+        let audit_head = match storage.get(AUDIT_HEAD_KEY) {
+            None => (0, [0u8; 32]),
+            Some(sealed) => {
+                let plain = audit_key.open(sealed, AUDIT_HEAD_KEY)?;
+                if plain.len() != 8 + 32 {
+                    return Err(EngineError::Corrupt("bad audit head".into()));
+                }
+                (
+                    u64::from_le_bytes(plain[..8].try_into().unwrap()),
+                    plain[8..].try_into().unwrap(),
+                )
+            }
+        };
+
         Ok(Engine {
             storage,
             master,
             dir,
+            audit_head,
         })
+    }
+
+    /// The current audit head: how many statements the chain covers and
+    /// the root that commits to all of them. Safe to publish or store
+    /// externally — comparing it later detects history rollback.
+    pub fn audit_root(&self) -> (u64, [u8; 32]) {
+        self.audit_head
+    }
+
+    /// Recompute the audit chain from genesis and check every link.
+    ///
+    /// Verifies: entries decrypt (authentic, in-place), sequence numbers
+    /// are contiguous from 0, each entry extends the previous root, and
+    /// the final root matches the stored head. Returns the decoded
+    /// entries so callers can also check an externally recorded
+    /// `(seq, root)` pair against history.
+    pub fn audit_verify(&self) -> Result<Vec<AuditEntry>> {
+        let audit_key = self.master.derive_key("audit");
+        let mut entries = Vec::new();
+        let mut root = [0u8; 32];
+        for (key, sealed) in self.storage.scan_prefix(AUDIT_PREFIX) {
+            let plain = audit_key
+                .open(sealed, key)
+                .map_err(|_| EngineError::Audit("audit entry failed authentication".into()))?;
+            let entry = AuditEntry::decode(&plain)?;
+            if entry.seq != entries.len() as u64 {
+                return Err(EngineError::Audit(format!(
+                    "audit chain has a gap: expected seq {}, found {}",
+                    entries.len(),
+                    entry.seq
+                )));
+            }
+            if entry.prev_root != root {
+                return Err(EngineError::Audit(format!(
+                    "audit entry {} does not extend the previous root",
+                    entry.seq
+                )));
+            }
+            root = entry.root();
+            entries.push(entry);
+        }
+        if (entries.len() as u64, root) != self.audit_head {
+            return Err(EngineError::Audit(
+                "audit head does not match the recomputed chain".into(),
+            ));
+        }
+        Ok(entries)
     }
 
     /// Re-encrypt the whole database under a new passphrase (and KDF).
@@ -362,6 +501,20 @@ impl Engine {
             }
             fresh.storage.commit(writes)?;
         }
+
+        // Carry the audit chain across, re-sealed under the new audit
+        // key (chain roots are over plaintext entries, so they remain
+        // valid), then record the rotation itself as the next entry.
+        let old_audit = self.master.derive_key("audit");
+        let new_audit = fresh.master.derive_key("audit");
+        let mut audit_writes = Batch::new();
+        for (key, sealed) in self.storage.scan_prefix(AUDIT_PREFIX) {
+            let plain = old_audit.open(sealed, key)?;
+            audit_writes.put(key, &new_audit.seal(&plain, key));
+        }
+        fresh.storage.commit(audit_writes)?;
+        fresh.audit_head = self.audit_head;
+        fresh.commit_with_audit(audit_kind::ROTATE, [0u8; 16], [0u8; 32], Batch::new())?;
         drop(fresh);
 
         // The atomic switch, then cleanup of everything now stale.
@@ -538,7 +691,8 @@ impl Engine {
         };
         let mut batch = Batch::new();
         self.add_schema(&mut batch, &schema);
-        self.storage.commit(batch)?;
+        let tag = self.table_tag(&name);
+        self.commit_audited(audit_kind::CREATE_TABLE, tag, batch)?;
         Ok(QueryResult::Created(name))
     }
 
@@ -576,7 +730,7 @@ impl Engine {
         }
         schema.columns[col].indexed = true;
         self.add_schema(&mut batch, &schema);
-        self.storage.commit(batch)?;
+        self.commit_audited(audit_kind::CREATE_INDEX, self.table_tag(table), batch)?;
         Ok(QueryResult::IndexCreated {
             table: table.to_string(),
             column: column.to_string(),
@@ -603,7 +757,7 @@ impl Engine {
         }
         schema.columns[col].indexed = false;
         self.add_schema(&mut batch, &schema);
-        self.storage.commit(batch)?;
+        self.commit_audited(audit_kind::DROP_INDEX, self.table_tag(table), batch)?;
         Ok(QueryResult::IndexDropped {
             table: table.to_string(),
             column: column.to_string(),
@@ -620,7 +774,7 @@ impl Engine {
         }
         batch.delete(&self.seq_key(name));
         batch.delete(&self.catalog_key(name));
-        self.storage.commit(batch)?;
+        self.commit_audited(audit_kind::DROP_TABLE, self.table_tag(name), batch)?;
         Ok(QueryResult::Dropped(name.to_string()))
     }
 
@@ -706,7 +860,7 @@ impl Engine {
             next_id += 1;
         }
         self.add_seq(&mut writes, table, &table_key, next_id);
-        self.storage.commit(writes)?;
+        self.commit_audited(audit_kind::INSERT, self.table_tag(table), writes)?;
         Ok(QueryResult::Inserted(count))
     }
 
@@ -890,7 +1044,7 @@ impl Engine {
             let sealed = table_key.seal(&codec::encode_row(&new_row), &key);
             writes.put(&key, &sealed);
         }
-        self.storage.commit(writes)?;
+        self.commit_audited(audit_kind::UPDATE, self.table_tag(table), writes)?;
         Ok(QueryResult::Updated(count))
     }
 
@@ -921,7 +1075,7 @@ impl Engine {
             }
             writes.delete(&key);
         }
-        self.storage.commit(writes)?;
+        self.commit_audited(audit_kind::DELETE, self.table_tag(table), writes)?;
         Ok(QueryResult::Deleted(count))
     }
 
@@ -1112,6 +1266,68 @@ impl Engine {
         let sealed = table_key.seal(&next.to_le_bytes(), &key);
         batch.put(&key, &sealed);
     }
+
+    /// Commit a statement's writes together with its audit-chain entry —
+    /// one atomic batch, so history and data can never disagree. Empty
+    /// batches (statements that changed nothing) do not advance the chain.
+    fn commit_audited(&mut self, kind: u8, table_tag: [u8; 16], batch: Batch) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let digest = digest_batch(&batch);
+        self.commit_with_audit(kind, table_tag, digest, batch)
+    }
+
+    /// Append an audit entry for `kind` to `batch` and commit everything.
+    fn commit_with_audit(
+        &mut self,
+        kind: u8,
+        table_tag: [u8; 16],
+        writes_digest: [u8; 32],
+        mut batch: Batch,
+    ) -> Result<()> {
+        let (seq, prev_root) = self.audit_head;
+        let entry = AuditEntry {
+            seq,
+            time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            kind,
+            table_tag,
+            writes_digest,
+            prev_root,
+        };
+        let root = entry.root();
+        let audit_key = self.master.derive_key("audit");
+
+        let mut entry_key = AUDIT_PREFIX.to_vec();
+        entry_key.extend_from_slice(&seq.to_be_bytes());
+        batch.put(&entry_key, &audit_key.seal(&entry.encode(), &entry_key));
+
+        let mut head = seq.wrapping_add(1).to_le_bytes().to_vec();
+        head.extend_from_slice(&root);
+        batch.put(AUDIT_HEAD_KEY, &audit_key.seal(&head, AUDIT_HEAD_KEY));
+
+        self.storage.commit(batch)?;
+        self.audit_head = (seq + 1, root);
+        Ok(())
+    }
+}
+
+/// SHA-256 over a batch's operations: `op | key_len | key | value_len |
+/// value` per entry, all lengths LE. Binds an audit entry to the exact
+/// sealed bytes the statement committed.
+fn digest_batch(batch: &Batch) -> [u8; 32] {
+    let mut hasher = ciphra_crypto::Sha256::new();
+    for (is_delete, key, value) in batch.entries() {
+        hasher.update(&[u8::from(is_delete)]);
+        hasher.update(&(key.len() as u64).to_le_bytes());
+        hasher.update(key);
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value);
+    }
+    hasher.finalize()
 }
 
 /// Index of the PRIMARY KEY column, if the table declares one.
@@ -1860,6 +2076,94 @@ mod tests {
         assert_eq!(rows_of(db.execute("SELECT * FROM t").unwrap()).len(), 0);
         // EXPLAIN of unsupported statements is a parse error.
         assert!(db.execute("EXPLAIN CREATE TABLE u (a INT)").is_err());
+    }
+
+    #[test]
+    fn audit_chain_records_every_statement() {
+        let dir = ciphra_testutil::tempdir();
+        let mut db = engine(dir.path());
+        assert_eq!(db.audit_root(), (0, [0u8; 32]));
+
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+            .unwrap();
+        db.execute("UPDATE t SET v = 'c' WHERE id = 1").unwrap();
+        db.execute("DELETE FROM t WHERE id = 2").unwrap();
+        // A statement that changes nothing does not advance the chain.
+        db.execute("DELETE FROM t WHERE id = 999").unwrap();
+
+        let (seq, root) = db.audit_root();
+        assert_eq!(seq, 4);
+        assert_ne!(root, [0u8; 32]);
+
+        let entries = db.audit_verify().unwrap();
+        assert_eq!(entries.len(), 4);
+        let kinds: Vec<u8> = entries.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                audit_kind::CREATE_TABLE,
+                audit_kind::INSERT,
+                audit_kind::UPDATE,
+                audit_kind::DELETE,
+            ]
+        );
+        // All four touched the same table: same opaque tag, never zeros.
+        assert!(entries.iter().all(|e| e.table_tag == entries[0].table_tag));
+        assert_ne!(entries[0].table_tag, [0u8; 16]);
+
+        // Chain and head survive reopen.
+        drop(db);
+        let db = engine(dir.path());
+        assert_eq!(db.audit_root(), (seq, root));
+        db.audit_verify().unwrap();
+    }
+
+    #[test]
+    fn audit_chain_detects_history_tampering() {
+        let dir = ciphra_testutil::tempdir();
+        {
+            let mut db = engine(dir.path());
+            db.execute(
+                "CREATE TABLE t (a INT); INSERT INTO t VALUES (1); \
+                 INSERT INTO t VALUES (2); INSERT INTO t VALUES (3);",
+            )
+            .unwrap();
+        }
+        // An attacker with file access deletes one audit entry (storage
+        // itself permits this - it is the chain that must catch it).
+        {
+            let mut raw = ciphra_storage::Storage::open(dir.path()).unwrap();
+            let keys: Vec<Vec<u8>> = raw.scan_prefix(b"a\x00").map(|(k, _)| k.to_vec()).collect();
+            assert_eq!(keys.len(), 4);
+            raw.delete(&keys[1]).unwrap();
+        }
+        let db = engine(dir.path());
+        let err = db.audit_verify().expect_err("tampered chain must fail");
+        assert!(matches!(err, EngineError::Audit(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn audit_chain_survives_rotation() {
+        let dir = ciphra_testutil::tempdir();
+        let mut db = engine(dir.path());
+        db.execute("CREATE TABLE t (a INT); INSERT INTO t VALUES (1);")
+            .unwrap();
+        let (seq_before, _) = db.audit_root();
+
+        db.rotate_to("rotated-pass", KdfParams::Pbkdf2 { iterations: 3 })
+            .unwrap();
+
+        // The chain continued: all old entries plus one ROTATE entry.
+        let entries = db.audit_verify().unwrap();
+        assert_eq!(entries.len() as u64, seq_before + 1);
+        assert_eq!(entries.last().unwrap().kind, audit_kind::ROTATE);
+
+        // And keeps extending after rotation.
+        db.execute("INSERT INTO t VALUES (2)").unwrap();
+        let entries = db.audit_verify().unwrap();
+        assert_eq!(entries.last().unwrap().kind, audit_kind::INSERT);
     }
 
     #[test]

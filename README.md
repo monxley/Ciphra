@@ -72,6 +72,10 @@ rather than add-ons.
   Argon2id — is implemented in this repository and verified against
   official RFC/NIST test vectors. The supply chain is: the Rust
   standard library, and this repo.
+- **Tamper-evident audit chain**: every mutating statement appends a
+  sealed hash-chain entry in the same atomic commit as its data.
+  `.audit verify` re-checks all of history; publish `.audit root`
+  externally and any rollback of the database file becomes detectable.
 - **Key rotation**: `ciphra --rotate-passphrase` re-encrypts the whole
   database under a new passphrase (new salt, new KDF, new table and
   index tags) with an atomic file swap — a crash cannot strand the

@@ -42,8 +42,10 @@ later.
 - [ ] Queryable encryption layers with an explicit, documented leakage
       profile (equality via deterministic tags; range via order-revealing
       structures — opt-in per column, never silent)
-- [ ] Tamper-evident audit log: Merkle tree over all mutations,
-      externally verifiable roots
+- [x] Tamper-evident audit chain: sealed hash-chain entry per
+      statement, committed atomically with its data; `.audit
+      root`/`.audit verify`; rollback detection via external roots.
+      (Merkle tree for O(log n) inclusion proofs: planned upgrade)
 - [ ] `VECTOR` type + similarity search over encrypted embeddings
 - [ ] Backup/restore, snapshot export (sealed)
 

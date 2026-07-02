@@ -219,6 +219,14 @@ impl Batch {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    /// Iterate the batched operations as `(is_delete, key, value)`.
+    /// Lets callers derive digests over exactly what will be committed.
+    pub fn entries(&self) -> impl Iterator<Item = (bool, &[u8], &[u8])> {
+        self.entries
+            .iter()
+            .map(|(op, key, value)| (*op == OP_DELETE, key.as_slice(), value.as_slice()))
+    }
 }
 
 /// A decoded WAL record.
