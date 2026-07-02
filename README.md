@@ -47,6 +47,9 @@ rather than add-ons.
   compound `WHERE` (`AND`/`OR`/`NOT`, parentheses, `IS [NOT] NULL`)
   with proper SQL three-valued logic; `ORDER BY` / `LIMIT` / `OFFSET`;
   typed columns (`INT`, `TEXT`).
+- **`PRIMARY KEY`** with uniqueness and non-NULL enforcement, backed by
+  an encrypted equality index: `WHERE pk = x` is a point lookup, not a
+  scan — and the index stores only keyed tags of values, never values.
 - **Durable storage engine**: checksummed write-ahead log with crash
   recovery (torn writes are detected via CRC-32 and truncated) and log
   compaction.

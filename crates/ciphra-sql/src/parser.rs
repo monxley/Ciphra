@@ -54,11 +54,23 @@ impl Parser {
                 "text" | "varchar" => DataType::Text,
                 other => return Err(ParseError(format!("unknown column type: {other:?}"))),
             };
-            let encrypted = self.eat_keyword("encrypted");
+            let mut encrypted = false;
+            let mut primary_key = false;
+            loop {
+                if self.eat_keyword("encrypted") {
+                    encrypted = true;
+                } else if self.eat_keyword("primary") {
+                    self.expect_keyword("key")?;
+                    primary_key = true;
+                } else {
+                    break;
+                }
+            }
             columns.push(ColumnDef {
                 name: col_name,
                 ty,
                 encrypted,
+                primary_key,
             });
             if !self.eat(&Token::Comma) {
                 break;

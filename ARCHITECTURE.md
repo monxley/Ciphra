@@ -133,7 +133,15 @@ queryable-encryption levels, which will need it.
 \x00catalog\x00<tag16>      sealed schema (incl. the real table name)
 \x00seq\x00<tag16>          sealed next row id (u64)
 r\x00<tag16><id BE>         sealed row (big-endian id keeps key order = insert order)
+x\x00<tag16><vtag16>        sealed row id — PRIMARY KEY index entry
 ```
 
 `<tag16>` is the opaque table tag described above — no plaintext table
-names appear in keys.
+names appear in keys. `<vtag16>` is the same construction applied to a
+primary-key *value* (`HMAC(master-derived per-table key, encoded
+value)`), so `WHERE pk = x` is an index lookup that never materializes
+the value on disk. Leakage: equality of PK values only — and PK values
+are unique among live rows, so in practice a tag repeats only if a
+value is deleted and re-inserted. `INSERT` validates a whole batch
+(types, arity, PK) before writing anything; row + index writes are not
+atomic under crash, and a dangling index entry reads as absent.

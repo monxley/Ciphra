@@ -25,6 +25,9 @@ impl TableSchema {
     }
 }
 
+const FLAG_ENCRYPTED: u8 = 1 << 0;
+const FLAG_PRIMARY_KEY: u8 = 1 << 1;
+
 /// Schema layout: `version (1) | name_len (2 LE) | name | ncols (2 LE)`
 /// then per column: `flags (1) | type (1) | name_len (2 LE) | name`.
 pub fn encode_schema(schema: &TableSchema) -> Vec<u8> {
@@ -33,7 +36,14 @@ pub fn encode_schema(schema: &TableSchema) -> Vec<u8> {
     out.extend_from_slice(schema.name.as_bytes());
     out.extend_from_slice(&(schema.columns.len() as u16).to_le_bytes());
     for col in &schema.columns {
-        out.push(u8::from(col.encrypted));
+        let mut flags = 0u8;
+        if col.encrypted {
+            flags |= FLAG_ENCRYPTED;
+        }
+        if col.primary_key {
+            flags |= FLAG_PRIMARY_KEY;
+        }
+        out.push(flags);
         out.push(match col.ty {
             DataType::Int => TAG_INT,
             DataType::Text => TAG_TEXT,
@@ -65,7 +75,9 @@ pub fn decode_schema(buf: &[u8]) -> Result<TableSchema> {
         if buf.len() < pos + 4 {
             return Err(corrupt());
         }
-        let encrypted = buf[pos] != 0;
+        let flags = buf[pos];
+        let encrypted = flags & FLAG_ENCRYPTED != 0;
+        let primary_key = flags & FLAG_PRIMARY_KEY != 0;
         let ty = match buf[pos + 1] {
             TAG_INT => DataType::Int,
             TAG_TEXT => DataType::Text,
@@ -84,6 +96,7 @@ pub fn decode_schema(buf: &[u8]) -> Result<TableSchema> {
             name: col_name,
             ty,
             encrypted,
+            primary_key,
         });
     }
     if pos != buf.len() {
@@ -171,11 +184,13 @@ mod tests {
                     name: "id".into(),
                     ty: DataType::Int,
                     encrypted: false,
+                    primary_key: true,
                 },
                 ColumnDef {
                     name: "ssn".into(),
                     ty: DataType::Text,
                     encrypted: true,
+                    primary_key: false,
                 },
             ],
         };

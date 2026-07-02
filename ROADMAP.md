@@ -21,8 +21,9 @@ later.
       logic), `ORDER BY`, `LIMIT`/`OFFSET`
 - [x] Encrypted table names via opaque keyed tags (no user plaintext
       on disk at all)
-- [ ] Primary keys and secondary indexes (over sealed values;
-      leakage-free point lookups first)
+- [x] Primary keys: uniqueness + non-NULL enforcement, point lookups
+      through an encrypted equality index (keyed value tags)
+- [ ] Secondary indexes (`CREATE INDEX`) over sealed values
 - [ ] Argon2id as the default KDF (memory-hard; PBKDF2 kept for compat)
 - [ ] Key rotation: re-seal a table under a new master
 - [ ] `EXPLAIN`, basic statistics

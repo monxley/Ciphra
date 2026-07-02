@@ -65,6 +65,9 @@ pub struct ColumnDef {
     /// rest; this flag reserves per-column semantics for the queryable
     /// encryption layers (see ROADMAP.md).
     pub encrypted: bool,
+    /// Marked `PRIMARY KEY` in the DDL: unique, non-NULL, and backed by
+    /// an equality index for point lookups. At most one per table.
+    pub primary_key: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,8 +182,8 @@ mod tests {
     }
 
     #[test]
-    fn create_table_with_encrypted_column() {
-        let stmt = one("CREATE TABLE users (id INT, name TEXT, ssn TEXT ENCRYPTED);");
+    fn create_table_with_column_markers() {
+        let stmt = one("CREATE TABLE users (id INT PRIMARY KEY, name TEXT, ssn TEXT ENCRYPTED);");
         assert_eq!(
             stmt,
             Statement::CreateTable {
@@ -189,21 +192,32 @@ mod tests {
                     ColumnDef {
                         name: "id".into(),
                         ty: DataType::Int,
-                        encrypted: false
+                        encrypted: false,
+                        primary_key: true,
                     },
                     ColumnDef {
                         name: "name".into(),
                         ty: DataType::Text,
-                        encrypted: false
+                        encrypted: false,
+                        primary_key: false,
                     },
                     ColumnDef {
                         name: "ssn".into(),
                         ty: DataType::Text,
-                        encrypted: true
+                        encrypted: true,
+                        primary_key: false,
                     },
                 ],
             }
         );
+        // Markers compose in any order.
+        let stmt = one("CREATE TABLE t (k TEXT ENCRYPTED PRIMARY KEY)");
+        let Statement::CreateTable { columns, .. } = stmt else {
+            unreachable!()
+        };
+        assert!(columns[0].encrypted && columns[0].primary_key);
+        // PRIMARY without KEY is an error.
+        assert!(parse_statements("CREATE TABLE t (k INT PRIMARY)").is_err());
     }
 
     #[test]
