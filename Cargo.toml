@@ -7,6 +7,7 @@ members = [
     "crates/ciphra-engine",
     "crates/ciphra",
     "crates/ciphra-testutil",
+    "crates/ciphra-bench",
 ]
 
 [workspace.package]

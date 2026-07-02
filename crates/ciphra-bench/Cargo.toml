@@ -1,0 +1,17 @@
+[package]
+name = "ciphra-bench"
+description = "Ciphra micro-benchmarks: honest numbers with encryption cost included"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "ciphra-bench"
+path = "src/main.rs"
+
+[dependencies]
+ciphra-engine.workspace = true
+ciphra-testutil = { workspace = true }
