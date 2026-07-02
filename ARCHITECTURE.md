@@ -71,6 +71,31 @@ open); a crash after it leaves the new database complete. Keeping the
 KDF parameters inside the WAL is what makes the database a single file
 and the swap atomic.
 
+### Audit chain
+
+Every mutating statement appends a sealed entry to a hash chain:
+`root_i = SHA-256(entry_i)` where the entry contains the previous root,
+a sequence number, a timestamp, the statement kind, the opaque table
+tag and a digest over the statement's sealed writes. The entry commits
+in the *same atomic batch* as the data it describes, so history and
+data cannot disagree. Entries contain no user plaintext — a published
+root cannot be used to brute-force secret content.
+
+What it adds on top of AEAD: per-value encryption already stops
+*modification*, but an attacker with file access could still delete
+whole WAL records or roll the entire file back to an older valid state.
+The chain makes both evident: `.audit verify` recomputes the chain from
+genesis (catching deletion, reordering and splicing), and comparing
+`.audit root` against an externally recorded `(seq, root)` pair catches
+whole-file rollback — the one check that inherently needs a reference
+point outside the attacker's reach. Key rotation carries the chain
+across (roots are over plaintext entries, so re-sealing preserves them)
+and records itself as a ROTATE entry.
+
+v1 is a linear hash chain — the degenerate Merkle case; a tree for
+O(log n) inclusion proofs is the planned upgrade and changes no on-disk
+entry, only adds structure above it.
+
 ### Sealing
 
 Envelope: `nonce (12, random per seal) | ciphertext | tag (16)` using
@@ -115,6 +140,9 @@ Protected against:
   truncation of a value fails AEAD verification. WAL corruption is
   additionally caught by CRC (integrity of *storage*, not secrecy).
 - **Wrong-key confusion**: canary check refuses to open.
+- **History tampering**: deleting/reordering audit entries breaks the
+  chain; rolling the whole file back is caught by comparing the current
+  audit root against one recorded externally.
 
 NOT protected against (yet — see ROADMAP):
 
