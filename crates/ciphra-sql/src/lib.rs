@@ -32,15 +32,18 @@ pub enum Statement {
     DropTable {
         name: String,
     },
-    /// `CREATE INDEX ON table (column)` — an equality index.
+    /// `CREATE [RANGE] INDEX ON table (column)` — an equality index,
+    /// or a sealed range index when `range` is set.
     CreateIndex {
         table: String,
         column: String,
+        range: bool,
     },
-    /// `DROP INDEX ON table (column)`.
+    /// `DROP [RANGE] INDEX ON table (column)`.
     DropIndex {
         table: String,
         column: String,
+        range: bool,
     },
     Insert {
         table: String,
@@ -85,6 +88,9 @@ pub struct ColumnDef {
     /// parser always leaves this false; the engine flips it via
     /// `CREATE INDEX` / `DROP INDEX` and persists it in the catalog.
     pub indexed: bool,
+    /// Has a sealed range index (`CREATE RANGE INDEX`). Engine-managed,
+    /// like `indexed`.
+    pub range_indexed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,6 +242,7 @@ mod tests {
                         encrypted: false,
                         primary_key: true,
                         indexed: false,
+                        range_indexed: false,
                     },
                     ColumnDef {
                         name: "name".into(),
@@ -243,6 +250,7 @@ mod tests {
                         encrypted: false,
                         primary_key: false,
                         indexed: false,
+                        range_indexed: false,
                     },
                     ColumnDef {
                         name: "ssn".into(),
@@ -250,6 +258,7 @@ mod tests {
                         encrypted: true,
                         primary_key: false,
                         indexed: false,
+                        range_indexed: false,
                     },
                 ],
             }
@@ -271,6 +280,7 @@ mod tests {
             Statement::CreateIndex {
                 table: "users".into(),
                 column: "name".into(),
+                range: false,
             }
         );
         assert_eq!(
@@ -278,8 +288,26 @@ mod tests {
             Statement::DropIndex {
                 table: "users".into(),
                 column: "name".into(),
+                range: false,
             }
         );
+        assert_eq!(
+            one("CREATE RANGE INDEX ON users (age)"),
+            Statement::CreateIndex {
+                table: "users".into(),
+                column: "age".into(),
+                range: true,
+            }
+        );
+        assert_eq!(
+            one("DROP RANGE INDEX ON users (age)"),
+            Statement::DropIndex {
+                table: "users".into(),
+                column: "age".into(),
+                range: true,
+            }
+        );
+        assert!(parse_statements("CREATE RANGE TABLE t (a INT)").is_err());
         assert!(parse_statements("CREATE INDEX users (name)").is_err());
         assert!(parse_statements("CREATE INDEX ON users ()").is_err());
         assert!(parse_statements("CREATE INDEX ON users (a, b)").is_err());

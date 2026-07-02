@@ -187,6 +187,7 @@ fn meta_command(engine: &mut Engine, command: &str) -> bool {
     UPDATE t SET name = 'robert' WHERE id = 2;
     DELETE FROM t WHERE name = 'bob';
     CREATE INDEX ON t (name);
+    CREATE RANGE INDEX ON t (id);
     DROP INDEX ON t (name);
     EXPLAIN SELECT * FROM t WHERE id = 2;
     DROP TABLE t;
@@ -236,7 +237,12 @@ All rows are ChaCha20-Poly1305 encrypted before they reach disk."
                         let pk = if col.primary_key { " PRIMARY KEY" } else { "" };
                         let enc = if col.encrypted { " ENCRYPTED" } else { "" };
                         let idx = if col.indexed { " INDEXED" } else { "" };
-                        println!("{} {ty}{pk}{enc}{idx}", col.name);
+                        let rng = if col.range_indexed {
+                            " RANGE-INDEXED"
+                        } else {
+                            ""
+                        };
+                        println!("{} {ty}{pk}{enc}{idx}{rng}", col.name);
                     }
                 }
                 Err(e) => eprintln!("{e}"),
@@ -259,11 +265,21 @@ fn print_result(result: &QueryResult) {
     match result {
         QueryResult::Created(name) => println!("created table {name}"),
         QueryResult::Dropped(name) => println!("dropped table {name}"),
-        QueryResult::IndexCreated { table, column } => {
-            println!("created index on {table} ({column})")
+        QueryResult::IndexCreated {
+            table,
+            column,
+            range,
+        } => {
+            let kind = if *range { "range index" } else { "index" };
+            println!("created {kind} on {table} ({column})")
         }
-        QueryResult::IndexDropped { table, column } => {
-            println!("dropped index on {table} ({column})")
+        QueryResult::IndexDropped {
+            table,
+            column,
+            range,
+        } => {
+            let kind = if *range { "range index" } else { "index" };
+            println!("dropped {kind} on {table} ({column})")
         }
         QueryResult::Inserted(n) => println!("inserted {n} row{}", plural(*n)),
         QueryResult::Updated(n) => println!("updated {n} row{}", plural(*n)),

@@ -50,6 +50,11 @@ rather than add-ons.
 - **`PRIMARY KEY`** with uniqueness and non-NULL enforcement, backed by
   an encrypted equality index: `WHERE pk = x` is a point lookup, not a
   scan — and the index stores only keyed tags of values, never values.
+- **Range queries over encrypted data** (`CREATE RANGE INDEX ON t
+  (col)`): a sorted value list sealed inside a single ciphertext —
+  unlike OPE/ORE, the disk learns nothing about order or equality, only
+  the blob's size. `WHERE amount >= x` decrypts one blob and fetches
+  only matching rows.
 - **Secondary indexes** (`CREATE INDEX ON t (col)` / `DROP INDEX`):
   the same value-tag construction, non-unique, backfilled on creation
   and maintained by every INSERT/UPDATE/DELETE. Opt-in per column, with
