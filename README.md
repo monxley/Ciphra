@@ -22,7 +22,7 @@ ciphra> SELECT name, ssn FROM users WHERE id >= 2;
 +------+-------------+
 1 row
 
-$ grep -c 'alice\|111-22-3333' db/ciphra.wal
+$ grep -c 'alice\|111-22-3333\|users\|ssn' db/ciphra.wal
 0
 $ CIPHRA_PASSPHRASE='wrong' ciphra --data ./db -e 'SELECT * FROM users;'
 error: wrong passphrase for this database
@@ -42,9 +42,14 @@ rather than add-ons.
 
 ## What works today
 
-- **SQL engine written from scratch**: hand-written lexer/parser
-  (`CREATE TABLE`, `INSERT`, `SELECT` with `WHERE`, `DELETE`,
-  `DROP TABLE`), typed columns (`INT`, `TEXT`), `NULL` semantics.
+- **SQL engine written from scratch**: hand-written lexer/parser —
+  `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `DROP TABLE`;
+  compound `WHERE` (`AND`/`OR`/`NOT`, parentheses, `IS [NOT] NULL`)
+  with proper SQL three-valued logic; `ORDER BY` / `LIMIT` / `OFFSET`;
+  typed columns (`INT`, `TEXT`).
+- **`PRIMARY KEY`** with uniqueness and non-NULL enforcement, backed by
+  an encrypted equality index: `WHERE pk = x` is a point lookup, not a
+  scan — and the index stores only keyed tags of values, never values.
 - **Durable storage engine**: checksummed write-ahead log with crash
   recovery (torn writes are detected via CRC-32 and truncated) and log
   compaction.
@@ -52,6 +57,10 @@ rather than add-ons.
   passphrase (PBKDF2-HMAC-SHA256 → HKDF-SHA256), whole-row
   ChaCha20-Poly1305 with AAD binding each ciphertext to its table and
   row id — encrypted rows cannot be swapped or replayed undetected.
+- **No user plaintext on disk at all**: values, column names *and table
+  names*. Tables are addressed in storage by opaque keyed tags
+  (HMAC under a master-derived key); the real name lives only inside
+  the sealed catalog record.
 - **Zero third-party dependencies.** The entire engine — including
   SHA-256, HMAC, HKDF, PBKDF2, ChaCha20 and Poly1305 — is implemented in
   this repository and verified against official RFC/NIST test vectors.
@@ -89,8 +98,8 @@ deliberately does not yet.
 
 ## Roadmap (abridged)
 
-- **Phase 1** — richer SQL (`UPDATE`, primary keys, secondary indexes),
-  Argon2id KDF, key rotation, encrypted table names.
+- **Phase 1** (in progress) — richer SQL ✅, encrypted table names ✅;
+  next: primary keys, secondary indexes, Argon2id KDF, key rotation.
 - **Phase 2** — queryable encryption (deterministic/order-revealing
   layers with an explicit leakage profile), Merkle-tree audit log,
   vector type + similarity search.

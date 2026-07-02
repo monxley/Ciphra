@@ -85,6 +85,18 @@ impl MasterKey {
         hkdf_expand(&prk, context.as_bytes(), &mut key);
         CipherKey(key)
     }
+
+    /// Deterministic keyed tag: an opaque, stable identifier for `data`
+    /// that reveals nothing about it without the master key. Used to
+    /// name objects (e.g. tables) inside storage keys, where a random
+    /// nonce cannot be used because lookups must be repeatable.
+    ///
+    /// Leakage: equality only — the same `(purpose, data)` always maps
+    /// to the same tag under one master key.
+    pub fn keyed_tag(&self, purpose: &str, data: &[u8]) -> [u8; 32] {
+        let tag_key = self.derive_key(&format!("tag:{purpose}"));
+        hmac_sha256(&tag_key.0, data)
+    }
 }
 
 /// A ChaCha20-Poly1305 key for one table / purpose.
@@ -182,6 +194,28 @@ mod tests {
         let a = key.seal(b"same plaintext", b"");
         let b = key.seal(b"same plaintext", b"");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn keyed_tags_are_deterministic_and_scoped() {
+        let m = master();
+        assert_eq!(
+            m.keyed_tag("table", b"users"),
+            m.keyed_tag("table", b"users")
+        );
+        assert_ne!(
+            m.keyed_tag("table", b"users"),
+            m.keyed_tag("table", b"orders")
+        );
+        assert_ne!(
+            m.keyed_tag("table", b"users"),
+            m.keyed_tag("index", b"users")
+        );
+        let other = MasterKey::derive_from_passphrase("other", b"0123456789abcdef", 2);
+        assert_ne!(
+            m.keyed_tag("table", b"users"),
+            other.keyed_tag("table", b"users")
+        );
     }
 
     #[test]

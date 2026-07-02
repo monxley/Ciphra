@@ -1,7 +1,10 @@
 //! Recursive-descent parser for the Ciphra SQL dialect.
 
 use crate::lexer::{Token, tokenize};
-use crate::{CmpOp, ColumnDef, DataType, Literal, ParseError, Predicate, Projection, Statement};
+use crate::{
+    Assignment, CmpOp, ColumnDef, DataType, Expr, Limit, Literal, OrderBy, ParseError, Projection,
+    Statement,
+};
 
 /// Parse zero or more `;`-separated statements.
 pub fn parse_statements(input: &str) -> Result<Vec<Statement>, ParseError> {
@@ -33,6 +36,7 @@ impl Parser {
             "drop" => self.drop_table(),
             "insert" => self.insert(),
             "select" => self.select(),
+            "update" => self.update(),
             "delete" => self.delete(),
             other => Err(ParseError(format!("unknown statement: {other:?}"))),
         }
@@ -50,11 +54,23 @@ impl Parser {
                 "text" | "varchar" => DataType::Text,
                 other => return Err(ParseError(format!("unknown column type: {other:?}"))),
             };
-            let encrypted = self.eat_keyword("encrypted");
+            let mut encrypted = false;
+            let mut primary_key = false;
+            loop {
+                if self.eat_keyword("encrypted") {
+                    encrypted = true;
+                } else if self.eat_keyword("primary") {
+                    self.expect_keyword("key")?;
+                    primary_key = true;
+                } else {
+                    break;
+                }
+            }
             columns.push(ColumnDef {
                 name: col_name,
                 ty,
                 encrypted,
+                primary_key,
             });
             if !self.eat(&Token::Comma) {
                 break;
@@ -118,11 +134,62 @@ impl Parser {
         self.expect_keyword("from")?;
         let table = self.identifier("table name")?;
         let predicate = self.optional_where()?;
+
+        let order_by = if self.eat_keyword("order") {
+            self.expect_keyword("by")?;
+            let column = self.identifier("column name")?;
+            let descending = if self.eat_keyword("desc") {
+                true
+            } else {
+                self.eat_keyword("asc");
+                false
+            };
+            Some(OrderBy { column, descending })
+        } else {
+            None
+        };
+
+        let limit = if self.eat_keyword("limit") {
+            let count = self.unsigned("a row count after LIMIT")?;
+            let offset = if self.eat_keyword("offset") {
+                self.unsigned("a row count after OFFSET")?
+            } else {
+                0
+            };
+            Some(Limit { count, offset })
+        } else {
+            None
+        };
+
         Ok(Statement::Select {
             columns,
             table,
             predicate,
+            order_by,
+            limit,
         })
+    }
+
+    fn update(&mut self) -> Result<Statement, ParseError> {
+        let table = self.identifier("table name")?;
+        self.expect_keyword("set")?;
+        let mut assignments = vec![self.assignment()?];
+        while self.eat(&Token::Comma) {
+            assignments.push(self.assignment()?);
+        }
+        let predicate = self.optional_where()?;
+        Ok(Statement::Update {
+            table,
+            assignments,
+            predicate,
+        })
+    }
+
+    fn assignment(&mut self) -> Result<Assignment, ParseError> {
+        let column = self.identifier("column name")?;
+        self.expect(&Token::Eq)?;
+        let value = self.literal()?;
+        Ok(Assignment { column, value })
     }
 
     fn delete(&mut self) -> Result<Statement, ParseError> {
@@ -132,11 +199,53 @@ impl Parser {
         Ok(Statement::Delete { table, predicate })
     }
 
-    fn optional_where(&mut self) -> Result<Option<Predicate>, ParseError> {
+    fn optional_where(&mut self) -> Result<Option<Expr>, ParseError> {
         if !self.eat_keyword("where") {
             return Ok(None);
         }
-        let column = self.identifier("column name")?;
+        Ok(Some(self.expr()?))
+    }
+
+    // -- expressions: OR < AND < NOT < primary --------------------------
+
+    fn expr(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.and_expr()?;
+        while self.eat_keyword("or") {
+            let right = self.and_expr()?;
+            left = Expr::Or(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn and_expr(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.not_expr()?;
+        while self.eat_keyword("and") {
+            let right = self.not_expr()?;
+            left = Expr::And(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn not_expr(&mut self) -> Result<Expr, ParseError> {
+        if self.eat_keyword("not") {
+            Ok(Expr::Not(Box::new(self.not_expr()?)))
+        } else {
+            self.primary_expr()
+        }
+    }
+
+    fn primary_expr(&mut self) -> Result<Expr, ParseError> {
+        if self.eat(&Token::LParen) {
+            let inner = self.expr()?;
+            self.expect(&Token::RParen)?;
+            return Ok(inner);
+        }
+        let column = self.identifier("a column name")?;
+        if self.eat_keyword("is") {
+            let negated = self.eat_keyword("not");
+            self.expect_keyword("null")?;
+            return Ok(Expr::IsNull { column, negated });
+        }
         let op = match self.next("a comparison operator")? {
             Token::Eq => CmpOp::Eq,
             Token::Ne => CmpOp::Ne,
@@ -151,7 +260,7 @@ impl Parser {
             }
         };
         let value = self.literal()?;
-        Ok(Some(Predicate { column, op, value }))
+        Ok(Expr::Compare { column, op, value })
     }
 
     fn literal(&mut self) -> Result<Literal, ParseError> {
@@ -166,6 +275,15 @@ impl Parser {
             },
             Token::Ident(kw) if kw == "null" => Ok(Literal::Null),
             other => Err(ParseError(format!("expected a literal, found {other}"))),
+        }
+    }
+
+    fn unsigned(&mut self, expected: &str) -> Result<u64, ParseError> {
+        match self.next(expected)? {
+            Token::Int(n) if n >= 0 => Ok(n as u64),
+            other => Err(ParseError(format!(
+                "expected a non-negative integer ({expected}), found {other}"
+            ))),
         }
     }
 
