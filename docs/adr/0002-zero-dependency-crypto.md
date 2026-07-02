@@ -25,6 +25,8 @@ specifications and gated by official test vectors:
 | Primitive | Spec | Vectors |
 |---|---|---|
 | SHA-256 | FIPS 180-4 | NIST CAVP |
+| BLAKE2b | RFC 7693 | RFC 7693 |
+| Argon2id | RFC 9106 | RFC 9106 |
 | HMAC | RFC 2104 | RFC 4231 |
 | HKDF | RFC 5869 | RFC 5869 |
 | PBKDF2 | RFC 8018 | RFC 7914 §11 |
@@ -49,6 +51,7 @@ by line, with no carry-propagation subtleties.
 - Performance is not competitive yet (byte-limb Poly1305, table-free
   scalar ChaCha20); acceptable for v0, optimized later without API
   changes.
-- Argon2id (memory-hard KDF) is deferred to Phase 1 since it is a much
-  larger implementation; PBKDF2 with 600k iterations is the interim
-  default, recorded per-database in `ciphra.keyparams`.
+- Argon2id (with its BLAKE2b base hash) was implemented in Phase 1 from
+  RFC 7693/9106 against the RFC test vectors and is now the default
+  KDF; PBKDF2 remains supported for databases that recorded it in
+  `ciphra.keyparams`.

@@ -57,7 +57,14 @@ use ciphra_sql::{
 use ciphra_storage::{Storage, StorageError};
 
 const KEYPARAMS_FILE: &str = "ciphra.keyparams";
-const KEYPARAMS_MAGIC: &[u8; 8] = b"CIPHRA\x00\x01";
+/// v1 layout: `magic | iterations u32 LE | salt` (PBKDF2 implied).
+const KEYPARAMS_MAGIC_V1: &[u8; 8] = b"CIPHRA\x00\x01";
+/// v2 layout: `magic | kdf u8 | params | salt` where kdf 1 = PBKDF2
+/// (`iterations u32`), kdf 2 = Argon2id (`m_kib u32 | passes u32 |
+/// lanes u32`), all LE.
+const KEYPARAMS_MAGIC_V2: &[u8; 8] = b"CIPHRA\x00\x02";
+const KDF_PBKDF2: u8 = 1;
+const KDF_ARGON2ID: u8 = 2;
 const CANARY_KEY: &[u8] = b"\x00canary";
 const CANARY_PLAINTEXT: &[u8] = b"ciphra-canary-v1";
 const CATALOG_PREFIX: &[u8] = b"\x00catalog\x00";
@@ -139,6 +146,45 @@ impl From<std::io::Error> for EngineError {
 
 pub type Result<T> = std::result::Result<T, EngineError>;
 
+/// How the master key is derived from the passphrase. Recorded in
+/// `ciphra.keyparams` when a database is created; existing databases
+/// always open with the parameters they were created with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KdfParams {
+    /// PBKDF2-HMAC-SHA256 — legacy, kept for older databases.
+    Pbkdf2 { iterations: u32 },
+    /// Argon2id — memory-hard, the default.
+    Argon2id {
+        memory_kib: u32,
+        passes: u32,
+        lanes: u32,
+    },
+}
+
+impl KdfParams {
+    /// The recommended default for new databases.
+    pub fn recommended() -> Self {
+        KdfParams::Argon2id {
+            memory_kib: ciphra_crypto::DEFAULT_ARGON2_MEMORY_KIB,
+            passes: ciphra_crypto::DEFAULT_ARGON2_PASSES,
+            lanes: ciphra_crypto::DEFAULT_ARGON2_LANES,
+        }
+    }
+
+    fn derive(self, passphrase: &str, salt: &[u8]) -> MasterKey {
+        match self {
+            KdfParams::Pbkdf2 { iterations } => {
+                MasterKey::derive_from_passphrase(passphrase, salt, iterations)
+            }
+            KdfParams::Argon2id {
+                memory_kib,
+                passes,
+                lanes,
+            } => MasterKey::derive_argon2id(passphrase, salt, memory_kib, passes, lanes),
+        }
+    }
+}
+
 /// Result of executing one statement.
 #[derive(Debug, PartialEq)]
 pub enum QueryResult {
@@ -168,41 +214,45 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Open (or create) a database in `dir` with the default KDF work
-    /// factor ([`ciphra_crypto::DEFAULT_KDF_ITERATIONS`]).
+    /// Open (or create) a database in `dir` with the recommended KDF
+    /// ([`KdfParams::recommended`], Argon2id).
     ///
     /// On first open a random salt and the KDF parameters are written
     /// next to the data (they are not secret) and a sealed canary is
     /// stored; subsequent opens verify the canary and fail with
     /// [`EngineError::BadPassphrase`] on a mismatch.
     pub fn open(dir: impl AsRef<Path>, passphrase: &str) -> Result<Self> {
-        Self::open_with_iterations(dir, passphrase, ciphra_crypto::DEFAULT_KDF_ITERATIONS)
+        Self::open_with_kdf(dir, passphrase, KdfParams::recommended())
     }
 
-    /// Like [`Engine::open`], with an explicit KDF work factor for a
-    /// database being created. An existing database always uses the
-    /// iteration count recorded at creation time.
+    /// Open with an explicit PBKDF2 work factor for a database being
+    /// created. Kept for compatibility and fast test setups; new code
+    /// should prefer [`Engine::open`] or [`Engine::open_with_kdf`].
     pub fn open_with_iterations(
         dir: impl AsRef<Path>,
         passphrase: &str,
         iterations: u32,
     ) -> Result<Self> {
+        Self::open_with_kdf(dir, passphrase, KdfParams::Pbkdf2 { iterations })
+    }
+
+    /// Like [`Engine::open`], with explicit KDF parameters for a
+    /// database being created. An existing database always uses the
+    /// parameters recorded at creation time.
+    pub fn open_with_kdf(dir: impl AsRef<Path>, passphrase: &str, kdf: KdfParams) -> Result<Self> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
 
         let params_path = dir.join(KEYPARAMS_FILE);
-        let (iterations, salt) = if params_path.exists() {
+        let (kdf, salt) = if params_path.exists() {
             read_keyparams(&std::fs::read(&params_path)?)?
         } else {
             let salt = ciphra_crypto::random_salt().to_vec();
-            let mut contents = KEYPARAMS_MAGIC.to_vec();
-            contents.extend_from_slice(&iterations.to_le_bytes());
-            contents.extend_from_slice(&salt);
-            std::fs::write(&params_path, &contents)?;
-            (iterations, salt)
+            std::fs::write(&params_path, encode_keyparams(kdf, &salt))?;
+            (kdf, salt)
         };
 
-        let master = MasterKey::derive_from_passphrase(passphrase, &salt, iterations);
+        let master = kdf.derive(passphrase, &salt);
         let mut storage = Storage::open(dir)?;
 
         let canary_key = master.derive_key("canary");
@@ -930,16 +980,82 @@ fn indexed_eq_value<'a>(
         .find_map(|(col, _)| eq_value_for(expr, col).map(|value| (col, value)))
 }
 
-/// Parse the keyparams file: `magic (8) | iterations (4 LE) | salt`.
-fn read_keyparams(contents: &[u8]) -> Result<(u32, Vec<u8>)> {
-    if contents.len() < 12 + ciphra_crypto::SALT_LEN || &contents[..8] != KEYPARAMS_MAGIC {
-        return Err(EngineError::Corrupt(format!("bad {KEYPARAMS_FILE} file")));
+/// Serialize KDF parameters and salt into the v2 keyparams format.
+fn encode_keyparams(kdf: KdfParams, salt: &[u8]) -> Vec<u8> {
+    let mut out = KEYPARAMS_MAGIC_V2.to_vec();
+    match kdf {
+        KdfParams::Pbkdf2 { iterations } => {
+            out.push(KDF_PBKDF2);
+            out.extend_from_slice(&iterations.to_le_bytes());
+        }
+        KdfParams::Argon2id {
+            memory_kib,
+            passes,
+            lanes,
+        } => {
+            out.push(KDF_ARGON2ID);
+            out.extend_from_slice(&memory_kib.to_le_bytes());
+            out.extend_from_slice(&passes.to_le_bytes());
+            out.extend_from_slice(&lanes.to_le_bytes());
+        }
     }
-    let iterations = u32::from_le_bytes(contents[8..12].try_into().unwrap());
-    if iterations == 0 {
-        return Err(EngineError::Corrupt(format!("bad {KEYPARAMS_FILE} file")));
+    out.extend_from_slice(salt);
+    out
+}
+
+/// Parse a keyparams file, v1 (PBKDF2 implied) or v2 (KDF recorded).
+fn read_keyparams(contents: &[u8]) -> Result<(KdfParams, Vec<u8>)> {
+    let corrupt = || EngineError::Corrupt(format!("bad {KEYPARAMS_FILE} file"));
+    if contents.len() < 8 {
+        return Err(corrupt());
     }
-    Ok((iterations, contents[12..].to_vec()))
+    let (magic, rest) = contents.split_at(8);
+    if magic == KEYPARAMS_MAGIC_V1 {
+        if rest.len() < 4 + ciphra_crypto::SALT_LEN {
+            return Err(corrupt());
+        }
+        let iterations = u32::from_le_bytes(rest[..4].try_into().unwrap());
+        if iterations == 0 {
+            return Err(corrupt());
+        }
+        return Ok((KdfParams::Pbkdf2 { iterations }, rest[4..].to_vec()));
+    }
+    if magic != KEYPARAMS_MAGIC_V2 || rest.is_empty() {
+        return Err(corrupt());
+    }
+    let (kdf_id, rest) = rest.split_at(1);
+    match kdf_id[0] {
+        KDF_PBKDF2 => {
+            if rest.len() < 4 + ciphra_crypto::SALT_LEN {
+                return Err(corrupt());
+            }
+            let iterations = u32::from_le_bytes(rest[..4].try_into().unwrap());
+            if iterations == 0 {
+                return Err(corrupt());
+            }
+            Ok((KdfParams::Pbkdf2 { iterations }, rest[4..].to_vec()))
+        }
+        KDF_ARGON2ID => {
+            if rest.len() < 12 + ciphra_crypto::SALT_LEN {
+                return Err(corrupt());
+            }
+            let memory_kib = u32::from_le_bytes(rest[..4].try_into().unwrap());
+            let passes = u32::from_le_bytes(rest[4..8].try_into().unwrap());
+            let lanes = u32::from_le_bytes(rest[8..12].try_into().unwrap());
+            if passes == 0 || lanes == 0 {
+                return Err(corrupt());
+            }
+            Ok((
+                KdfParams::Argon2id {
+                    memory_kib,
+                    passes,
+                    lanes,
+                },
+                rest[12..].to_vec(),
+            ))
+        }
+        _ => Err(corrupt()),
+    }
 }
 
 /// Convert a literal to a schema-typed value, or fail with a type error.
@@ -1474,6 +1590,53 @@ mod tests {
         // Row ids keep counting after reopen — no collisions with old rows.
         db.execute("INSERT INTO t VALUES (8)").unwrap();
         assert_eq!(rows_of(db.execute("SELECT * FROM t").unwrap()).len(), 2);
+    }
+
+    #[test]
+    fn argon2id_database_roundtrip() {
+        let dir = ciphra_testutil::tempdir();
+        // Tiny parameters: the test exercises wiring, not work factor.
+        let kdf = KdfParams::Argon2id {
+            memory_kib: 32,
+            passes: 1,
+            lanes: 1,
+        };
+        {
+            let mut db = Engine::open_with_kdf(dir.path(), "argon-pass", kdf).unwrap();
+            db.execute("CREATE TABLE t (a INT); INSERT INTO t VALUES (7);")
+                .unwrap();
+        }
+        // Reopen reads the recorded KDF from the keyparams file — the
+        // parameters passed here are ignored for an existing database.
+        let mut db =
+            Engine::open_with_kdf(dir.path(), "argon-pass", KdfParams::recommended()).unwrap();
+        assert_eq!(
+            rows_of(db.execute("SELECT * FROM t").unwrap()),
+            vec![vec![Value::Int(7)]]
+        );
+        drop(db);
+        let err = Engine::open_with_kdf(dir.path(), "wrong", kdf)
+            .err()
+            .expect("wrong passphrase must fail");
+        assert!(matches!(err, EngineError::BadPassphrase), "got {err:?}");
+    }
+
+    #[test]
+    fn v1_keyparams_files_still_open() {
+        let dir = ciphra_testutil::tempdir();
+        // Create a v1-format keyparams file by hand: PBKDF2 implied.
+        let salt = ciphra_crypto::random_salt();
+        let mut contents = b"CIPHRA\x00\x01".to_vec();
+        contents.extend_from_slice(&2u32.to_le_bytes());
+        contents.extend_from_slice(&salt);
+        std::fs::write(dir.path().join(KEYPARAMS_FILE), &contents).unwrap();
+
+        let mut db = Engine::open(dir.path(), "legacy-pass").unwrap();
+        db.execute("CREATE TABLE t (a INT); INSERT INTO t VALUES (1);")
+            .unwrap();
+        drop(db);
+        let mut db = Engine::open(dir.path(), "legacy-pass").unwrap();
+        assert_eq!(rows_of(db.execute("SELECT * FROM t").unwrap()).len(), 1);
     }
 
     #[test]

@@ -25,7 +25,8 @@ later.
       through an encrypted equality index (keyed value tags)
 - [x] Secondary indexes: `CREATE INDEX` / `DROP INDEX` with backfill,
       unified entry format with the PK index, opt-in equality leakage
-- [ ] Argon2id as the default KDF (memory-hard; PBKDF2 kept for compat)
+- [x] Argon2id as the default KDF (BLAKE2b + Argon2id from RFC
+      7693/9106, RFC test vectors; PBKDF2 databases keep opening)
 - [ ] Key rotation: re-seal a table under a new master
 - [ ] `EXPLAIN`, basic statistics
 - [ ] Benchmarks vs SQLite (honest numbers, encryption cost included)

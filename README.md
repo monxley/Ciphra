@@ -58,17 +58,20 @@ rather than add-ons.
   recovery (torn writes are detected via CRC-32 and truncated) and log
   compaction.
 - **Encryption at rest by construction**: per-table keys derived from a
-  passphrase (PBKDF2-HMAC-SHA256 → HKDF-SHA256), whole-row
-  ChaCha20-Poly1305 with AAD binding each ciphertext to its table and
-  row id — encrypted rows cannot be swapped or replayed undetected.
+  passphrase (Argon2id → HKDF-SHA256), whole-row ChaCha20-Poly1305 with
+  AAD binding each ciphertext to its table and row id — encrypted rows
+  cannot be swapped or replayed undetected. Argon2id (memory-hard,
+  RFC 9106) is the default KDF; databases created with PBKDF2 keep
+  opening with their recorded parameters.
 - **No user plaintext on disk at all**: values, column names *and table
   names*. Tables are addressed in storage by opaque keyed tags
   (HMAC under a master-derived key); the real name lives only inside
   the sealed catalog record.
 - **Zero third-party dependencies.** The entire engine — including
-  SHA-256, HMAC, HKDF, PBKDF2, ChaCha20 and Poly1305 — is implemented in
-  this repository and verified against official RFC/NIST test vectors.
-  The supply chain is: the Rust standard library, and this repo.
+  SHA-256, HMAC, HKDF, PBKDF2, ChaCha20, Poly1305, BLAKE2b and
+  Argon2id — is implemented in this repository and verified against
+  official RFC/NIST test vectors. The supply chain is: the Rust
+  standard library, and this repo.
 - **CLI/REPL** with meta commands (`.tables`, `.schema`, `.help`).
 
 ## Quick start

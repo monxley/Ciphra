@@ -40,16 +40,18 @@ concurrent access replace the internals later without touching callers.
 ### Key hierarchy
 
 ```
-passphrase ── PBKDF2-HMAC-SHA256(salt, iterations) ──► MasterKey   (memory only)
+passphrase ── Argon2id(salt, m, t, p) ─────────────► MasterKey   (memory only)
+              (PBKDF2-HMAC-SHA256 for pre-Argon2 databases)
 MasterKey  ── HKDF-SHA256("catalog")               ──► catalog key
 MasterKey  ── HKDF-SHA256("table:<name>")          ──► per-table key
 MasterKey  ── HKDF-SHA256("canary")                ──► canary key
 MasterKey  ── HMAC(HKDF("tag:table-name"), name)   ──► opaque table tag (16 bytes)
 ```
 
-- The salt and iteration count are stored in `ciphra.keyparams` (they
-  are not secret). The master key and everything below it never touch
-  disk.
+- The salt and KDF parameters are stored in `ciphra.keyparams` (they
+  are not secret); an existing database always opens with the
+  parameters it was created with. The master key and everything below
+  it never touch disk. Argon2id defaults: 19 MiB, t=2, p=1 (OWASP).
 - A sealed canary value is checked on open so a wrong passphrase fails
   fast and loudly, instead of surfacing as "corrupt data" later.
 
@@ -106,8 +108,8 @@ NOT protected against (yet — see ROADMAP):
 - **A compromised host at runtime**: the master key lives in process
   memory while the engine is open. Memory-safety of Rust helps; it is
   not a defense against root.
-- **Passphrase quality**: PBKDF2 slows brute force; it cannot save a
-  weak passphrase. Argon2id (memory-hard) is the planned default.
+- **Passphrase quality**: Argon2id makes brute force memory-expensive;
+  it cannot save a truly weak passphrase.
 - **Side channels beyond cache timing**: no claims yet.
 
 ## SQL engine (v0)
