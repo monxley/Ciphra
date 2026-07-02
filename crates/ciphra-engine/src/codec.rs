@@ -4,7 +4,9 @@
 use crate::{EngineError, Result, Value};
 use ciphra_sql::{ColumnDef, DataType};
 
-const SCHEMA_VERSION: u8 = 1;
+// v2: the table name moved inside the (sealed) schema record, so no
+// plaintext table names remain anywhere on disk.
+const SCHEMA_VERSION: u8 = 2;
 
 const TAG_NULL: u8 = 0;
 const TAG_INT: u8 = 1;
@@ -23,10 +25,12 @@ impl TableSchema {
     }
 }
 
-/// Schema layout: `version (1) | ncols (2 LE)` then per column:
-/// `flags (1) | type (1) | name_len (2 LE) | name`.
+/// Schema layout: `version (1) | name_len (2 LE) | name | ncols (2 LE)`
+/// then per column: `flags (1) | type (1) | name_len (2 LE) | name`.
 pub fn encode_schema(schema: &TableSchema) -> Vec<u8> {
     let mut out = vec![SCHEMA_VERSION];
+    out.extend_from_slice(&(schema.name.len() as u16).to_le_bytes());
+    out.extend_from_slice(schema.name.as_bytes());
     out.extend_from_slice(&(schema.columns.len() as u16).to_le_bytes());
     for col in &schema.columns {
         out.push(u8::from(col.encrypted));
@@ -40,13 +44,22 @@ pub fn encode_schema(schema: &TableSchema) -> Vec<u8> {
     out
 }
 
-pub fn decode_schema(name: &str, buf: &[u8]) -> Result<TableSchema> {
-    let corrupt = || EngineError::Corrupt(format!("bad schema record for table {name:?}"));
-    if buf.len() < 3 || buf[0] != SCHEMA_VERSION {
+pub fn decode_schema(buf: &[u8]) -> Result<TableSchema> {
+    let corrupt = || EngineError::Corrupt("bad schema record in catalog".into());
+    if buf.len() < 5 || buf[0] != SCHEMA_VERSION {
         return Err(corrupt());
     }
-    let ncols = u16::from_le_bytes([buf[1], buf[2]]) as usize;
+    let name_len = u16::from_le_bytes([buf[1], buf[2]]) as usize;
     let mut pos = 3usize;
+    if buf.len() < pos + name_len + 2 {
+        return Err(corrupt());
+    }
+    let name = std::str::from_utf8(&buf[pos..pos + name_len])
+        .map_err(|_| corrupt())?
+        .to_string();
+    pos += name_len;
+    let ncols = u16::from_le_bytes([buf[pos], buf[pos + 1]]) as usize;
+    pos += 2;
     let mut columns = Vec::with_capacity(ncols);
     for _ in 0..ncols {
         if buf.len() < pos + 4 {
@@ -58,15 +71,15 @@ pub fn decode_schema(name: &str, buf: &[u8]) -> Result<TableSchema> {
             TAG_TEXT => DataType::Text,
             _ => return Err(corrupt()),
         };
-        let name_len = u16::from_le_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
+        let col_name_len = u16::from_le_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
         pos += 4;
-        if buf.len() < pos + name_len {
+        if buf.len() < pos + col_name_len {
             return Err(corrupt());
         }
-        let col_name = std::str::from_utf8(&buf[pos..pos + name_len])
+        let col_name = std::str::from_utf8(&buf[pos..pos + col_name_len])
             .map_err(|_| corrupt())?
             .to_string();
-        pos += name_len;
+        pos += col_name_len;
         columns.push(ColumnDef {
             name: col_name,
             ty,
@@ -76,10 +89,7 @@ pub fn decode_schema(name: &str, buf: &[u8]) -> Result<TableSchema> {
     if pos != buf.len() {
         return Err(corrupt());
     }
-    Ok(TableSchema {
-        name: name.to_string(),
-        columns,
-    })
+    Ok(TableSchema { name, columns })
 }
 
 /// Row layout: `ncols (2 LE)` then per value a tag byte followed by:
@@ -169,7 +179,7 @@ mod tests {
                 },
             ],
         };
-        let decoded = decode_schema("users", &encode_schema(&schema)).unwrap();
+        let decoded = decode_schema(&encode_schema(&schema)).unwrap();
         assert_eq!(decoded, schema);
     }
 

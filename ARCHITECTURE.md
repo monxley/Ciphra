@@ -44,6 +44,7 @@ passphrase ── PBKDF2-HMAC-SHA256(salt, iterations) ──► MasterKey   (me
 MasterKey  ── HKDF-SHA256("catalog")               ──► catalog key
 MasterKey  ── HKDF-SHA256("table:<name>")          ──► per-table key
 MasterKey  ── HKDF-SHA256("canary")                ──► canary key
+MasterKey  ── HMAC(HKDF("tag:table-name"), name)   ──► opaque table tag (16 bytes)
 ```
 
 - The salt and iteration count are stored in `ciphra.keyparams` (they
@@ -62,7 +63,17 @@ location: an attacker who can edit the files cannot swap row 5 into row
 the tag check failing.
 
 What is sealed: every stored value — rows, table schemas (including
-column names), and row-id sequences.
+the table name and column names), and row-id sequences.
+
+### Table tags
+
+Storage keys cannot contain random nonces (lookups must be repeatable),
+so tables are addressed by a deterministic keyed tag:
+`HMAC-SHA256(master-derived tag key, table name)`, truncated to 16
+bytes. Without the master key a tag reveals nothing about the name; the
+only leakage is equality (the same table always maps to the same tag
+within one database). The real name is recovered by decrypting the
+catalog record, which is how `.tables` works.
 
 ### Why hand-written primitives?
 
@@ -89,8 +100,9 @@ Protected against:
 
 NOT protected against (yet — see ROADMAP):
 
-- **Metadata leakage**: table *names* appear in storage keys; row count,
-  row sizes and write patterns are visible. Column names are sealed.
+- **Metadata leakage**: row count, row sizes, table count and write
+  patterns are visible. Names (tables and columns) and values are not:
+  since format v2 no user-produced plaintext appears on disk.
 - **A compromised host at runtime**: the master key lives in process
   memory while the engine is open. Memory-safety of Rust helps; it is
   not a defense against root.
@@ -101,10 +113,14 @@ NOT protected against (yet — see ROADMAP):
 ## SQL engine (v0)
 
 Dialect: `CREATE TABLE` (INT/TEXT, `ENCRYPTED` column marker), `INSERT`
-(multi-row, optional column list), `SELECT` (projection, single
-comparison predicate), `DELETE`, `DROP TABLE`. Execution is a straight
-scan-filter-project over `scan_prefix` — no planner yet, by design: the
-planner earns its complexity only once secondary indexes exist.
+(multi-row, optional column list), `SELECT` (projection, compound
+`WHERE` with `AND`/`OR`/`NOT`/parentheses/`IS [NOT] NULL`, `ORDER BY
+... ASC|DESC`, `LIMIT ... OFFSET`), `UPDATE ... SET`, `DELETE`,
+`DROP TABLE`. Predicates follow SQL three-valued logic: comparisons
+with NULL are *unknown* and filter the row out, and Kleene rules apply
+through AND/OR/NOT. Execution is a straight scan-filter-sort-project
+over `scan_prefix` — no planner yet, by design: the planner earns its
+complexity only once secondary indexes exist.
 
 The `ENCRYPTED` marker is accepted and recorded in the schema today
 (all rows are sealed regardless); it reserves the syntax for per-column
@@ -114,7 +130,10 @@ queryable-encryption levels, which will need it.
 
 ```
 \x00canary                  sealed wrong-passphrase detector
-\x00catalog\x00<table>      sealed schema
-\x00seq\x00<table>          sealed next row id (u64)
-r\x00<table>\x00<id BE>     sealed row (big-endian id keeps key order = insert order)
+\x00catalog\x00<tag16>      sealed schema (incl. the real table name)
+\x00seq\x00<tag16>          sealed next row id (u64)
+r\x00<tag16><id BE>         sealed row (big-endian id keeps key order = insert order)
 ```
+
+`<tag16>` is the opaque table tag described above — no plaintext table
+names appear in keys.

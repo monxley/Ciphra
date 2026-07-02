@@ -156,12 +156,13 @@ fn meta_command(engine: &mut Engine, command: &str) -> bool {
                 "SQL:
     CREATE TABLE t (id INT, name TEXT, ssn TEXT ENCRYPTED);
     INSERT INTO t (id, name) VALUES (1, 'alice'), (2, 'bob');
-    SELECT * FROM t WHERE id >= 2;
-    SELECT name FROM t;
+    SELECT * FROM t WHERE id >= 2 AND (name = 'bob' OR ssn IS NULL)
+        ORDER BY id DESC LIMIT 10 OFFSET 5;
+    UPDATE t SET name = 'robert' WHERE id = 2;
     DELETE FROM t WHERE name = 'bob';
     DROP TABLE t;
 
-All rows are AES-256-GCM encrypted before they reach disk."
+All rows are ChaCha20-Poly1305 encrypted before they reach disk."
             );
         }
         ".tables" => match engine.tables() {
@@ -208,6 +209,7 @@ fn print_result(result: &QueryResult) {
         QueryResult::Created(name) => println!("created table {name}"),
         QueryResult::Dropped(name) => println!("dropped table {name}"),
         QueryResult::Inserted(n) => println!("inserted {n} row{}", plural(*n)),
+        QueryResult::Updated(n) => println!("updated {n} row{}", plural(*n)),
         QueryResult::Deleted(n) => println!("deleted {n} row{}", plural(*n)),
         QueryResult::Rows { columns, rows } => print_table(columns, rows),
     }

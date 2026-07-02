@@ -7,9 +7,10 @@
 //! CREATE TABLE users (id INT, name TEXT, ssn TEXT ENCRYPTED);
 //! DROP TABLE users;
 //! INSERT INTO users (id, name) VALUES (1, 'alice'), (2, 'bob');
-//! SELECT * FROM users WHERE id >= 2;
-//! SELECT name, ssn FROM users;
-//! DELETE FROM users WHERE name = 'bob';
+//! SELECT * FROM users WHERE id >= 2 AND (name = 'bob' OR ssn IS NULL)
+//!     ORDER BY id DESC LIMIT 10 OFFSET 5;
+//! UPDATE users SET name = 'robert', ssn = NULL WHERE id = 2;
+//! DELETE FROM users WHERE NOT name = 'bob';
 //! ```
 //!
 //! The grammar is intentionally small; it grows with the engine rather
@@ -41,11 +42,18 @@ pub enum Statement {
     Select {
         columns: Projection,
         table: String,
-        predicate: Option<Predicate>,
+        predicate: Option<Expr>,
+        order_by: Option<OrderBy>,
+        limit: Option<Limit>,
+    },
+    Update {
+        table: String,
+        assignments: Vec<Assignment>,
+        predicate: Option<Expr>,
     },
     Delete {
         table: String,
-        predicate: Option<Predicate>,
+        predicate: Option<Expr>,
     },
 }
 
@@ -78,12 +86,42 @@ pub enum Projection {
     Columns(Vec<String>),
 }
 
-/// A single-column comparison, the only predicate form in v0.
+/// One `column = literal` pair in an `UPDATE ... SET` list.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Predicate {
+pub struct Assignment {
     pub column: String,
-    pub op: CmpOp,
     pub value: Literal,
+}
+
+/// A `WHERE` expression. Comparisons follow SQL three-valued logic:
+/// any comparison with NULL is *unknown*, and only rows for which the
+/// whole expression is *true* match.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    Compare {
+        column: String,
+        op: CmpOp,
+        value: Literal,
+    },
+    IsNull {
+        column: String,
+        negated: bool,
+    },
+    Not(Box<Expr>),
+    And(Box<Expr>, Box<Expr>),
+    Or(Box<Expr>, Box<Expr>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderBy {
+    pub column: String,
+    pub descending: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limit {
+    pub count: u64,
+    pub offset: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +168,14 @@ mod tests {
         let mut stmts = parse_statements(sql).unwrap();
         assert_eq!(stmts.len(), 1, "expected exactly one statement");
         stmts.remove(0)
+    }
+
+    fn cmp(column: &str, op: CmpOp, value: Literal) -> Expr {
+        Expr::Compare {
+            column: column.into(),
+            op,
+            value,
+        }
     }
 
     #[test]
@@ -184,24 +230,137 @@ mod tests {
             Statement::Select {
                 columns: Projection::All,
                 table: "users".into(),
-                predicate: Some(Predicate {
-                    column: "id".into(),
-                    op: CmpOp::Ge,
-                    value: Literal::Int(-2),
-                }),
+                predicate: Some(cmp("id", CmpOp::Ge, Literal::Int(-2))),
+                order_by: None,
+                limit: None,
             }
         );
     }
 
     #[test]
-    fn select_columns_no_predicate() {
-        let stmt = one("SELECT name, ssn FROM users");
+    fn and_binds_tighter_than_or() {
+        // a = 1 OR b = 2 AND c = 3  ==  a = 1 OR (b = 2 AND c = 3)
+        let stmt = one("SELECT * FROM t WHERE a = 1 OR b = 2 AND c = 3");
+        let Statement::Select {
+            predicate: Some(expr),
+            ..
+        } = stmt
+        else {
+            panic!("expected a select with a predicate");
+        };
+        assert_eq!(
+            expr,
+            Expr::Or(
+                Box::new(cmp("a", CmpOp::Eq, Literal::Int(1))),
+                Box::new(Expr::And(
+                    Box::new(cmp("b", CmpOp::Eq, Literal::Int(2))),
+                    Box::new(cmp("c", CmpOp::Eq, Literal::Int(3))),
+                )),
+            )
+        );
+    }
+
+    #[test]
+    fn parentheses_override_precedence() {
+        let stmt = one("SELECT * FROM t WHERE (a = 1 OR b = 2) AND c = 3");
+        let Statement::Select {
+            predicate: Some(expr),
+            ..
+        } = stmt
+        else {
+            panic!("expected a select with a predicate");
+        };
+        assert_eq!(
+            expr,
+            Expr::And(
+                Box::new(Expr::Or(
+                    Box::new(cmp("a", CmpOp::Eq, Literal::Int(1))),
+                    Box::new(cmp("b", CmpOp::Eq, Literal::Int(2))),
+                )),
+                Box::new(cmp("c", CmpOp::Eq, Literal::Int(3))),
+            )
+        );
+    }
+
+    #[test]
+    fn not_and_is_null() {
+        let stmt = one("SELECT * FROM t WHERE NOT a IS NULL AND b IS NOT NULL");
+        let Statement::Select {
+            predicate: Some(expr),
+            ..
+        } = stmt
+        else {
+            panic!("expected a select with a predicate");
+        };
+        assert_eq!(
+            expr,
+            Expr::And(
+                Box::new(Expr::Not(Box::new(Expr::IsNull {
+                    column: "a".into(),
+                    negated: false
+                }))),
+                Box::new(Expr::IsNull {
+                    column: "b".into(),
+                    negated: true
+                }),
+            )
+        );
+    }
+
+    #[test]
+    fn order_by_limit_offset() {
+        let stmt = one("SELECT name FROM t ORDER BY id DESC LIMIT 10 OFFSET 5");
         assert_eq!(
             stmt,
             Statement::Select {
-                columns: Projection::Columns(vec!["name".into(), "ssn".into()]),
-                table: "users".into(),
+                columns: Projection::Columns(vec!["name".into()]),
+                table: "t".into(),
                 predicate: None,
+                order_by: Some(OrderBy {
+                    column: "id".into(),
+                    descending: true
+                }),
+                limit: Some(Limit {
+                    count: 10,
+                    offset: 5
+                }),
+            }
+        );
+        let stmt = one("SELECT * FROM t ORDER BY id ASC");
+        let Statement::Select {
+            order_by, limit, ..
+        } = stmt
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            order_by,
+            Some(OrderBy {
+                column: "id".into(),
+                descending: false
+            })
+        );
+        assert_eq!(limit, None);
+    }
+
+    #[test]
+    fn update_statement() {
+        let stmt = one("UPDATE users SET name = 'robert', ssn = NULL WHERE id = 2");
+        assert_eq!(
+            stmt,
+            Statement::Update {
+                table: "users".into(),
+                assignments: vec![
+                    Assignment {
+                        column: "name".into(),
+                        value: Literal::Text("robert".into())
+                    },
+                    Assignment {
+                        column: "ssn".into(),
+                        value: Literal::Null
+                    },
+                ],
+                predicate: Some(cmp("id", CmpOp::Eq, Literal::Int(2))),
             }
         );
     }
@@ -212,11 +371,7 @@ mod tests {
             one("DELETE FROM users WHERE name <> 'bob'"),
             Statement::Delete {
                 table: "users".into(),
-                predicate: Some(Predicate {
-                    column: "name".into(),
-                    op: CmpOp::Ne,
-                    value: Literal::Text("bob".into()),
-                }),
+                predicate: Some(cmp("name", CmpOp::Ne, Literal::Text("bob".into()))),
             }
         );
         assert_eq!(
@@ -234,15 +389,21 @@ mod tests {
     }
 
     #[test]
-    fn keywords_are_case_insensitive_identifiers_are_not_keywords() {
-        let stmt = one("select A, b from T");
+    fn keywords_are_case_insensitive() {
+        let stmt = one("select A, b from T order by A desc limit 1");
+        let Statement::Select {
+            columns, order_by, ..
+        } = stmt
+        else {
+            unreachable!()
+        };
+        assert_eq!(columns, Projection::Columns(vec!["a".into(), "b".into()]));
         assert_eq!(
-            stmt,
-            Statement::Select {
-                columns: Projection::Columns(vec!["a".into(), "b".into()]),
-                table: "t".into(),
-                predicate: None,
-            }
+            order_by,
+            Some(OrderBy {
+                column: "a".into(),
+                descending: true
+            })
         );
     }
 
@@ -253,6 +414,13 @@ mod tests {
         assert!(parse_statements("INSERT INTO t VALUES").is_err());
         assert!(parse_statements("SELECT * FROM t WHERE").is_err());
         assert!(parse_statements("SELECT * FROM t WHERE x ! 1").is_err());
+        assert!(parse_statements("SELECT * FROM t WHERE (a = 1").is_err());
+        assert!(parse_statements("SELECT * FROM t WHERE a = 1 AND").is_err());
+        assert!(parse_statements("SELECT * FROM t WHERE a IS 1").is_err());
+        assert!(parse_statements("SELECT * FROM t LIMIT -1").is_err());
+        assert!(parse_statements("SELECT * FROM t ORDER id").is_err());
+        assert!(parse_statements("UPDATE t SET").is_err());
+        assert!(parse_statements("UPDATE t SET a 1").is_err());
         assert!(parse_statements("'unterminated").is_err());
     }
 }

@@ -4,37 +4,48 @@
 //! executed against `ciphra-storage`, with every row sealed by
 //! `ciphra-crypto` before it touches disk.
 //!
-//! Encryption model (v0): each table gets its own ChaCha20-Poly1305 key
+//! Encryption model: each table gets its own ChaCha20-Poly1305 key
 //! derived from the master key (`HKDF(master, "table:<name>")`). Whole
 //! rows are encrypted; the AAD binds each ciphertext to its table and
 //! row id, so encrypted rows cannot be moved or replayed across
 //! tables/rows without detection. Plaintext row data never reaches the
 //! storage layer.
 //!
+//! Tables are identified inside storage keys by an opaque 16-byte
+//! keyed tag (`HMAC(master-derived key, name)`), never by name — the
+//! name itself lives only inside the sealed schema record. With that,
+//! no plaintext produced by the user (values, column names, table
+//! names) appears anywhere on disk.
+//!
 //! Key layout inside storage (every value is sealed):
 //!
 //! ```text
-//! \x00canary                 -> sealed marker to detect a wrong passphrase
-//! \x00catalog\x00<table>     -> sealed TableSchema
-//! \x00seq\x00<table>         -> sealed next row id (u64 LE)
-//! r\x00<table>\x00<id BE>    -> sealed row
+//! \x00canary               -> sealed marker to detect a wrong passphrase
+//! \x00catalog\x00<tag16>   -> sealed TableSchema (incl. the real name)
+//! \x00seq\x00<tag16>       -> sealed next row id (u64 LE)
+//! r\x00<tag16><id BE>      -> sealed row
 //! ```
 
 mod codec;
 
+use std::cmp::Ordering;
 use std::path::Path;
 
 pub use ciphra_sql::{ColumnDef, DataType};
 pub use codec::TableSchema;
 
 use ciphra_crypto::{CipherKey, CryptoError, MasterKey};
-use ciphra_sql::{CmpOp, Literal, ParseError, Predicate, Projection, Statement};
+use ciphra_sql::{
+    Assignment, CmpOp, Expr, Limit, Literal, OrderBy, ParseError, Projection, Statement,
+};
 use ciphra_storage::{Storage, StorageError};
 
 const KEYPARAMS_FILE: &str = "ciphra.keyparams";
 const KEYPARAMS_MAGIC: &[u8; 8] = b"CIPHRA\x00\x01";
 const CANARY_KEY: &[u8] = b"\x00canary";
 const CANARY_PLAINTEXT: &[u8] = b"ciphra-canary-v1";
+const CATALOG_PREFIX: &[u8] = b"\x00catalog\x00";
+const TABLE_TAG_LEN: usize = 16;
 
 /// A single value in a row.
 #[derive(Debug, Clone, PartialEq)]
@@ -115,6 +126,7 @@ pub enum QueryResult {
     Created(String),
     Dropped(String),
     Inserted(usize),
+    Updated(usize),
     Deleted(usize),
     Rows {
         columns: Vec<String>,
@@ -193,26 +205,29 @@ impl Engine {
         Ok(results)
     }
 
-    /// List the names of all tables.
+    /// List the names of all tables, alphabetically.
+    ///
+    /// Names only exist inside sealed catalog records, so this decrypts
+    /// each schema rather than reading storage keys.
     pub fn tables(&self) -> Result<Vec<String>> {
-        let prefix = b"\x00catalog\x00";
+        let catalog_key = self.master.derive_key("catalog");
         let mut names = Vec::new();
-        for (key, _) in self.storage.scan_prefix(prefix) {
-            let name = std::str::from_utf8(&key[prefix.len()..])
-                .map_err(|_| EngineError::Corrupt("non-utf8 table name in catalog".into()))?;
-            names.push(name.to_string());
+        for (key, sealed) in self.storage.scan_prefix(CATALOG_PREFIX) {
+            let plain = catalog_key.open(sealed, key)?;
+            names.push(codec::decode_schema(&plain)?.name);
         }
+        names.sort();
         Ok(names)
     }
 
     /// Fetch the schema of `table`, if it exists.
     pub fn schema(&self, table: &str) -> Result<Option<TableSchema>> {
-        let key = catalog_key(table);
+        let key = self.catalog_key(table);
         match self.storage.get(&key) {
             None => Ok(None),
             Some(sealed) => {
                 let plain = self.master.derive_key("catalog").open(sealed, &key)?;
-                Ok(Some(codec::decode_schema(table, &plain)?))
+                Ok(Some(codec::decode_schema(&plain)?))
             }
         }
     }
@@ -230,16 +245,19 @@ impl Engine {
                 columns,
                 table,
                 predicate,
-            } => self.select(&table, columns, predicate),
+                order_by,
+                limit,
+            } => self.select(&table, columns, predicate, order_by, limit),
+            Statement::Update {
+                table,
+                assignments,
+                predicate,
+            } => self.update(&table, assignments, predicate),
             Statement::Delete { table, predicate } => self.delete(&table, predicate),
         }
     }
 
-    fn create_table(
-        &mut self,
-        name: String,
-        columns: Vec<ciphra_sql::ColumnDef>,
-    ) -> Result<QueryResult> {
+    fn create_table(&mut self, name: String, columns: Vec<ColumnDef>) -> Result<QueryResult> {
         if self.schema(&name)?.is_some() {
             return Err(EngineError::Schema(format!(
                 "table {name:?} already exists"
@@ -258,7 +276,7 @@ impl Engine {
             name: name.clone(),
             columns,
         };
-        let key = catalog_key(&name);
+        let key = self.catalog_key(&name);
         let sealed = self
             .master
             .derive_key("catalog")
@@ -271,14 +289,16 @@ impl Engine {
         self.expect_schema(name)?;
         let row_keys: Vec<Vec<u8>> = self
             .storage
-            .scan_prefix(&row_prefix(name))
+            .scan_prefix(&self.row_prefix(name))
             .map(|(k, _)| k.to_vec())
             .collect();
         for key in row_keys {
             self.storage.delete(&key)?;
         }
-        self.storage.delete(&seq_key(name))?;
-        self.storage.delete(&catalog_key(name))?;
+        let seq = self.seq_key(name);
+        self.storage.delete(&seq)?;
+        let catalog = self.catalog_key(name);
+        self.storage.delete(&catalog)?;
         Ok(QueryResult::Dropped(name.to_string()))
     }
 
@@ -319,7 +339,7 @@ impl Engine {
             for (pos, literal) in positions.iter().zip(literals) {
                 row[*pos] = coerce(literal, &schema.columns[*pos])?;
             }
-            let key = row_key(table, next_id);
+            let key = self.row_key(table, next_id);
             let sealed = table_key.seal(&codec::encode_row(&row), &key);
             self.storage.put(&key, &sealed)?;
             next_id += 1;
@@ -332,12 +352,12 @@ impl Engine {
         &mut self,
         table: &str,
         projection: Projection,
-        predicate: Option<Predicate>,
+        predicate: Option<Expr>,
+        order_by: Option<OrderBy>,
+        limit: Option<Limit>,
     ) -> Result<QueryResult> {
         let schema = self.expect_schema(table)?;
-        let filter = predicate
-            .map(|p| compile_predicate(&schema, p))
-            .transpose()?;
+        let filter = predicate.map(|p| compile_expr(&schema, p)).transpose()?;
 
         let output: Vec<usize> = match &projection {
             Projection::All => (0..schema.columns.len()).collect(),
@@ -355,32 +375,115 @@ impl Engine {
             .map(|&i| schema.columns[i].name.clone())
             .collect();
 
+        let sort_index = order_by
+            .as_ref()
+            .map(|ob| {
+                schema.column_index(&ob.column).ok_or_else(|| {
+                    EngineError::Schema(format!(
+                        "unknown column {:?} in table {table:?}",
+                        ob.column
+                    ))
+                })
+            })
+            .transpose()?;
+
         let table_key = self.table_key(table);
         let mut rows = Vec::new();
-        for (key, sealed) in self.storage.scan_prefix(&row_prefix(table)) {
+        for (key, sealed) in self.storage.scan_prefix(&self.row_prefix(table)) {
             let row = codec::decode_row(&table_key.open(sealed, key)?)?;
             if let Some(filter) = &filter
                 && !filter.matches(&row)?
             {
                 continue;
             }
-            rows.push(output.iter().map(|&i| row[i].clone()).collect());
+            rows.push(row);
         }
+
+        // Sort whole rows first so ORDER BY works on unprojected columns.
+        if let (Some(index), Some(ob)) = (sort_index, &order_by) {
+            rows.sort_by(|a, b| {
+                let ord = compare_values(&a[index], &b[index]);
+                if ob.descending { ord.reverse() } else { ord }
+            });
+        }
+
+        let rows: Vec<Vec<Value>> = match limit {
+            Some(Limit { count, offset }) => rows
+                .into_iter()
+                .skip(offset as usize)
+                .take(count as usize)
+                .map(|row| output.iter().map(|&i| row[i].clone()).collect())
+                .collect(),
+            None => rows
+                .into_iter()
+                .map(|row| output.iter().map(|&i| row[i].clone()).collect())
+                .collect(),
+        };
         Ok(QueryResult::Rows {
             columns: column_names,
             rows,
         })
     }
 
-    fn delete(&mut self, table: &str, predicate: Option<Predicate>) -> Result<QueryResult> {
+    fn update(
+        &mut self,
+        table: &str,
+        assignments: Vec<Assignment>,
+        predicate: Option<Expr>,
+    ) -> Result<QueryResult> {
         let schema = self.expect_schema(table)?;
-        let filter = predicate
-            .map(|p| compile_predicate(&schema, p))
-            .transpose()?;
+        let filter = predicate.map(|p| compile_expr(&schema, p)).transpose()?;
+
+        // Resolve `SET` targets to (index, typed value) against the schema.
+        let mut resolved: Vec<(usize, Value)> = Vec::with_capacity(assignments.len());
+        let mut seen = std::collections::HashSet::new();
+        for assignment in assignments {
+            let index = schema.column_index(&assignment.column).ok_or_else(|| {
+                EngineError::Schema(format!(
+                    "unknown column {:?} in table {table:?}",
+                    assignment.column
+                ))
+            })?;
+            if !seen.insert(index) {
+                return Err(EngineError::Schema(format!(
+                    "column {:?} assigned twice",
+                    assignment.column
+                )));
+            }
+            resolved.push((index, coerce(assignment.value, &schema.columns[index])?));
+        }
+
+        let table_key = self.table_key(table);
+        let mut changed: Vec<(Vec<u8>, Vec<Value>)> = Vec::new();
+        for (key, sealed) in self.storage.scan_prefix(&self.row_prefix(table)) {
+            let row = codec::decode_row(&table_key.open(sealed, key)?)?;
+            let matches = match &filter {
+                Some(filter) => filter.matches(&row)?,
+                None => true,
+            };
+            if matches {
+                let mut new_row = row;
+                for (index, value) in &resolved {
+                    new_row[*index] = value.clone();
+                }
+                changed.push((key.to_vec(), new_row));
+            }
+        }
+        let count = changed.len();
+        for (key, row) in changed {
+            let sealed = table_key.seal(&codec::encode_row(&row), &key);
+            self.storage.put(&key, &sealed)?;
+        }
+        Ok(QueryResult::Updated(count))
+    }
+
+    fn delete(&mut self, table: &str, predicate: Option<Expr>) -> Result<QueryResult> {
+        let schema = self.expect_schema(table)?;
+        let filter = predicate.map(|p| compile_expr(&schema, p)).transpose()?;
         let table_key = self.table_key(table);
 
         let mut doomed = Vec::new();
-        for (key, sealed) in self.storage.scan_prefix(&row_prefix(table)) {
+        for (key, sealed) in self.storage.scan_prefix(&self.row_prefix(table)) {
             let row = codec::decode_row(&table_key.open(sealed, key)?)?;
             let matches = match &filter {
                 Some(filter) => filter.matches(&row)?,
@@ -408,8 +511,40 @@ impl Engine {
         self.master.derive_key(&format!("table:{table}"))
     }
 
+    /// Opaque identifier for a table inside storage keys. Deterministic
+    /// (lookups must be repeatable) but reveals nothing about the name.
+    fn table_tag(&self, table: &str) -> [u8; TABLE_TAG_LEN] {
+        let full = self.master.keyed_tag("table-name", table.as_bytes());
+        full[..TABLE_TAG_LEN].try_into().unwrap()
+    }
+
+    fn catalog_key(&self, table: &str) -> Vec<u8> {
+        let mut key = CATALOG_PREFIX.to_vec();
+        key.extend_from_slice(&self.table_tag(table));
+        key
+    }
+
+    fn seq_key(&self, table: &str) -> Vec<u8> {
+        let mut key = b"\x00seq\x00".to_vec();
+        key.extend_from_slice(&self.table_tag(table));
+        key
+    }
+
+    fn row_prefix(&self, table: &str) -> Vec<u8> {
+        let mut prefix = b"r\x00".to_vec();
+        prefix.extend_from_slice(&self.table_tag(table));
+        prefix
+    }
+
+    /// Big-endian row id so lexicographic key order equals insertion order.
+    fn row_key(&self, table: &str, id: u64) -> Vec<u8> {
+        let mut key = self.row_prefix(table);
+        key.extend_from_slice(&id.to_be_bytes());
+        key
+    }
+
     fn load_seq(&self, table: &str, table_key: &CipherKey) -> Result<u64> {
-        let key = seq_key(table);
+        let key = self.seq_key(table);
         match self.storage.get(&key) {
             None => Ok(0),
             Some(sealed) => {
@@ -424,7 +559,7 @@ impl Engine {
     }
 
     fn store_seq(&mut self, table: &str, table_key: &CipherKey, next: u64) -> Result<()> {
-        let key = seq_key(table);
+        let key = self.seq_key(table);
         let sealed = table_key.seal(&next.to_le_bytes(), &key);
         self.storage.put(&key, &sealed)?;
         Ok(())
@@ -443,34 +578,8 @@ fn read_keyparams(contents: &[u8]) -> Result<(u32, Vec<u8>)> {
     Ok((iterations, contents[12..].to_vec()))
 }
 
-fn catalog_key(table: &str) -> Vec<u8> {
-    let mut key = b"\x00catalog\x00".to_vec();
-    key.extend_from_slice(table.as_bytes());
-    key
-}
-
-fn seq_key(table: &str) -> Vec<u8> {
-    let mut key = b"\x00seq\x00".to_vec();
-    key.extend_from_slice(table.as_bytes());
-    key
-}
-
-fn row_prefix(table: &str) -> Vec<u8> {
-    let mut prefix = b"r\x00".to_vec();
-    prefix.extend_from_slice(table.as_bytes());
-    prefix.push(0);
-    prefix
-}
-
-/// Big-endian row id so lexicographic key order equals insertion order.
-fn row_key(table: &str, id: u64) -> Vec<u8> {
-    let mut key = row_prefix(table);
-    key.extend_from_slice(&id.to_be_bytes());
-    key
-}
-
 /// Convert a literal to a schema-typed value, or fail with a type error.
-fn coerce(literal: Literal, column: &ciphra_sql::ColumnDef) -> Result<Value> {
+fn coerce(literal: Literal, column: &ColumnDef) -> Result<Value> {
     match (literal, column.ty) {
         (Literal::Null, _) => Ok(Value::Null),
         (Literal::Int(n), DataType::Int) => Ok(Value::Int(n)),
@@ -486,57 +595,130 @@ fn coerce(literal: Literal, column: &ciphra_sql::ColumnDef) -> Result<Value> {
     }
 }
 
-/// A predicate resolved against a schema: column index + typed comparison.
-struct CompiledPredicate {
-    column_index: usize,
-    column_name: String,
-    op: CmpOp,
-    value: Value,
+/// Total order for sorting within one (typed) column: NULLs sort first.
+fn compare_values(a: &Value, b: &Value) -> Ordering {
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Less,
+        (_, Value::Null) => Ordering::Greater,
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        // Unreachable with typed columns; defined for totality.
+        (Value::Int(_), Value::Text(_)) => Ordering::Less,
+        (Value::Text(_), Value::Int(_)) => Ordering::Greater,
+    }
 }
 
-fn compile_predicate(schema: &TableSchema, predicate: Predicate) -> Result<CompiledPredicate> {
-    let column_index = schema.column_index(&predicate.column).ok_or_else(|| {
-        EngineError::Schema(format!(
-            "unknown column {:?} in table {:?}",
-            predicate.column, schema.name
-        ))
-    })?;
-    let value = match predicate.value {
-        Literal::Null => Value::Null,
-        Literal::Int(n) => Value::Int(n),
-        Literal::Text(s) => Value::Text(s),
+/// A predicate resolved against a schema: column indexes + typed values.
+enum CompiledExpr {
+    Compare {
+        column_index: usize,
+        column_name: String,
+        op: CmpOp,
+        value: Value,
+    },
+    IsNull {
+        column_index: usize,
+        negated: bool,
+    },
+    Not(Box<CompiledExpr>),
+    And(Box<CompiledExpr>, Box<CompiledExpr>),
+    Or(Box<CompiledExpr>, Box<CompiledExpr>),
+}
+
+fn compile_expr(schema: &TableSchema, expr: Expr) -> Result<CompiledExpr> {
+    let resolve = |column: &str| {
+        schema.column_index(column).ok_or_else(|| {
+            EngineError::Schema(format!(
+                "unknown column {column:?} in table {:?}",
+                schema.name
+            ))
+        })
     };
-    Ok(CompiledPredicate {
-        column_index,
-        column_name: predicate.column,
-        op: predicate.op,
-        value,
+    Ok(match expr {
+        Expr::Compare { column, op, value } => CompiledExpr::Compare {
+            column_index: resolve(&column)?,
+            column_name: column,
+            op,
+            value: match value {
+                Literal::Null => Value::Null,
+                Literal::Int(n) => Value::Int(n),
+                Literal::Text(s) => Value::Text(s),
+            },
+        },
+        Expr::IsNull { column, negated } => CompiledExpr::IsNull {
+            column_index: resolve(&column)?,
+            negated,
+        },
+        Expr::Not(inner) => CompiledExpr::Not(Box::new(compile_expr(schema, *inner)?)),
+        Expr::And(a, b) => CompiledExpr::And(
+            Box::new(compile_expr(schema, *a)?),
+            Box::new(compile_expr(schema, *b)?),
+        ),
+        Expr::Or(a, b) => CompiledExpr::Or(
+            Box::new(compile_expr(schema, *a)?),
+            Box::new(compile_expr(schema, *b)?),
+        ),
     })
 }
 
-impl CompiledPredicate {
+impl CompiledExpr {
+    /// A row matches only when the expression is definitely true
+    /// (SQL semantics: *unknown* filters the row out).
     fn matches(&self, row: &[Value]) -> Result<bool> {
-        let cell = &row[self.column_index];
-        let ordering = match (cell, &self.value) {
-            // SQL semantics: comparisons involving NULL are never true.
-            (Value::Null, _) | (_, Value::Null) => return Ok(false),
-            (Value::Int(a), Value::Int(b)) => a.cmp(b),
-            (Value::Text(a), Value::Text(b)) => a.cmp(b),
-            _ => {
-                return Err(EngineError::Type(format!(
-                    "cannot compare column {:?} with a value of a different type",
-                    self.column_name
-                )));
+        Ok(self.eval(row)? == Some(true))
+    }
+
+    /// Three-valued logic: `None` is SQL's *unknown*, produced by any
+    /// comparison involving NULL and propagated per Kleene logic.
+    fn eval(&self, row: &[Value]) -> Result<Option<bool>> {
+        match self {
+            CompiledExpr::Compare {
+                column_index,
+                column_name,
+                op,
+                value,
+            } => {
+                let cell = &row[*column_index];
+                let ordering = match (cell, value) {
+                    (Value::Null, _) | (_, Value::Null) => return Ok(None),
+                    (Value::Int(a), Value::Int(b)) => a.cmp(b),
+                    (Value::Text(a), Value::Text(b)) => a.cmp(b),
+                    _ => {
+                        return Err(EngineError::Type(format!(
+                            "cannot compare column {column_name:?} with a value of a \
+                             different type"
+                        )));
+                    }
+                };
+                Ok(Some(match op {
+                    CmpOp::Eq => ordering.is_eq(),
+                    CmpOp::Ne => ordering.is_ne(),
+                    CmpOp::Lt => ordering.is_lt(),
+                    CmpOp::Gt => ordering.is_gt(),
+                    CmpOp::Le => ordering.is_le(),
+                    CmpOp::Ge => ordering.is_ge(),
+                }))
             }
-        };
-        Ok(match self.op {
-            CmpOp::Eq => ordering.is_eq(),
-            CmpOp::Ne => ordering.is_ne(),
-            CmpOp::Lt => ordering.is_lt(),
-            CmpOp::Gt => ordering.is_gt(),
-            CmpOp::Le => ordering.is_le(),
-            CmpOp::Ge => ordering.is_ge(),
-        })
+            CompiledExpr::IsNull {
+                column_index,
+                negated,
+            } => {
+                let is_null = row[*column_index] == Value::Null;
+                Ok(Some(is_null != *negated))
+            }
+            CompiledExpr::Not(inner) => Ok(inner.eval(row)?.map(|b| !b)),
+            CompiledExpr::And(a, b) => Ok(match (a.eval(row)?, b.eval(row)?) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), Some(true)) => Some(true),
+                _ => None,
+            }),
+            CompiledExpr::Or(a, b) => Ok(match (a.eval(row)?, b.eval(row)?) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            }),
+        }
     }
 }
 
@@ -547,6 +729,17 @@ mod tests {
     fn engine(dir: &Path) -> Engine {
         // Low KDF work factor: tests exercise correctness, not brute-force cost.
         Engine::open_with_iterations(dir, "test-passphrase", 2).unwrap()
+    }
+
+    fn rows_of(results: Vec<QueryResult>) -> Vec<Vec<Value>> {
+        match results.into_iter().next().unwrap() {
+            QueryResult::Rows { rows, .. } => rows,
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    fn text(s: &str) -> Value {
+        Value::Text(s.into())
     }
 
     #[test]
@@ -566,23 +759,138 @@ mod tests {
 
         let results = db.execute("SELECT name FROM users WHERE id >= 2").unwrap();
         assert_eq!(
-            results,
-            vec![QueryResult::Rows {
-                columns: vec!["name".into()],
-                rows: vec![
-                    vec![Value::Text("bob".into())],
-                    vec![Value::Text("carol".into())],
-                ],
-            }]
+            rows_of(results),
+            vec![vec![text("bob")], vec![text("carol")]]
         );
 
         let results = db.execute("DELETE FROM users WHERE name = 'bob'").unwrap();
         assert_eq!(results, vec![QueryResult::Deleted(1)]);
         let results = db.execute("SELECT * FROM users").unwrap();
-        match &results[0] {
-            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 2),
-            other => panic!("unexpected result: {other:?}"),
-        }
+        assert_eq!(rows_of(results).len(), 2);
+    }
+
+    #[test]
+    fn update_rows() {
+        let dir = ciphra_testutil::tempdir();
+        let mut db = engine(dir.path());
+        db.execute(
+            "CREATE TABLE users (id INT, name TEXT); \
+             INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'carol');",
+        )
+        .unwrap();
+
+        let results = db
+            .execute("UPDATE users SET name = 'robert' WHERE id = 2")
+            .unwrap();
+        assert_eq!(results, vec![QueryResult::Updated(1)]);
+        let results = db.execute("SELECT name FROM users WHERE id = 2").unwrap();
+        assert_eq!(rows_of(results), vec![vec![text("robert")]]);
+
+        // Unfiltered update touches every row; NULL assignment works.
+        let results = db.execute("UPDATE users SET name = NULL").unwrap();
+        assert_eq!(results, vec![QueryResult::Updated(3)]);
+        let results = db
+            .execute("SELECT * FROM users WHERE name IS NULL")
+            .unwrap();
+        assert_eq!(rows_of(results).len(), 3);
+
+        // Type errors and unknown/duplicate columns are rejected.
+        assert!(matches!(
+            db.execute("UPDATE users SET id = 'nope'"),
+            Err(EngineError::Type(_))
+        ));
+        assert!(matches!(
+            db.execute("UPDATE users SET nope = 1"),
+            Err(EngineError::Schema(_))
+        ));
+        assert!(matches!(
+            db.execute("UPDATE users SET id = 1, id = 2"),
+            Err(EngineError::Schema(_))
+        ));
+    }
+
+    #[test]
+    fn compound_predicates() {
+        let dir = ciphra_testutil::tempdir();
+        let mut db = engine(dir.path());
+        db.execute(
+            "CREATE TABLE t (id INT, grp TEXT, score INT); \
+             INSERT INTO t VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 30), \
+             (4, 'b', NULL), (5, 'c', 50);",
+        )
+        .unwrap();
+
+        // AND binds tighter than OR.
+        let rows = rows_of(
+            db.execute("SELECT id FROM t WHERE grp = 'c' OR grp = 'a' AND score >= 20")
+                .unwrap(),
+        );
+        assert_eq!(rows, vec![vec![Value::Int(2)], vec![Value::Int(5)]]);
+
+        // Parentheses override.
+        let rows = rows_of(
+            db.execute("SELECT id FROM t WHERE (grp = 'c' OR grp = 'a') AND score >= 20")
+                .unwrap(),
+        );
+        assert_eq!(rows, vec![vec![Value::Int(2)], vec![Value::Int(5)]]);
+
+        // NULL comparisons are unknown: row 4 matches neither the
+        // predicate nor its negation...
+        let rows = rows_of(db.execute("SELECT id FROM t WHERE score >= 20").unwrap());
+        assert_eq!(rows.len(), 3);
+        let rows = rows_of(
+            db.execute("SELECT id FROM t WHERE NOT score >= 20")
+                .unwrap(),
+        );
+        assert_eq!(rows, vec![vec![Value::Int(1)]]);
+        // ...but IS NULL finds it.
+        let rows = rows_of(db.execute("SELECT id FROM t WHERE score IS NULL").unwrap());
+        assert_eq!(rows, vec![vec![Value::Int(4)]]);
+        let rows = rows_of(
+            db.execute("SELECT id FROM t WHERE score IS NOT NULL AND id <= 2")
+                .unwrap(),
+        );
+        assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+    }
+
+    #[test]
+    fn order_by_limit_offset() {
+        let dir = ciphra_testutil::tempdir();
+        let mut db = engine(dir.path());
+        db.execute(
+            "CREATE TABLE t (id INT, score INT); \
+             INSERT INTO t VALUES (1, 30), (2, 10), (3, NULL), (4, 20);",
+        )
+        .unwrap();
+
+        // ASC: NULLs first; the sort column need not be projected.
+        let rows = rows_of(db.execute("SELECT id FROM t ORDER BY score").unwrap());
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(3)],
+                vec![Value::Int(2)],
+                vec![Value::Int(4)],
+                vec![Value::Int(1)],
+            ]
+        );
+
+        // DESC + LIMIT/OFFSET applied after the sort.
+        let rows = rows_of(
+            db.execute("SELECT id FROM t ORDER BY score DESC LIMIT 2 OFFSET 1")
+                .unwrap(),
+        );
+        assert_eq!(rows, vec![vec![Value::Int(4)], vec![Value::Int(2)]]);
+
+        // LIMIT without ORDER BY keeps insertion order.
+        let rows = rows_of(db.execute("SELECT id FROM t LIMIT 2").unwrap());
+        assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+
+        // Unknown sort column is a schema error.
+        assert!(matches!(
+            db.execute("SELECT id FROM t ORDER BY nope"),
+            Err(EngineError::Schema(_))
+        ));
     }
 
     #[test]
@@ -595,20 +903,10 @@ mod tests {
         }
         let mut db = engine(dir.path());
         let results = db.execute("SELECT * FROM t").unwrap();
-        assert_eq!(
-            results,
-            vec![QueryResult::Rows {
-                columns: vec!["a".into()],
-                rows: vec![vec![Value::Int(7)]],
-            }]
-        );
+        assert_eq!(rows_of(results), vec![vec![Value::Int(7)]]);
         // Row ids keep counting after reopen — no collisions with old rows.
         db.execute("INSERT INTO t VALUES (8)").unwrap();
-        let results = db.execute("SELECT * FROM t").unwrap();
-        match &results[0] {
-            QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 2),
-            other => panic!("unexpected result: {other:?}"),
-        }
+        assert_eq!(rows_of(db.execute("SELECT * FROM t").unwrap()).len(), 2);
     }
 
     #[test]
@@ -625,7 +923,7 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_never_touches_disk() {
+    fn no_user_plaintext_touches_disk() {
         let dir = ciphra_testutil::tempdir();
         let secret = "SUPER-SECRET-SSN-987654321";
         {
@@ -635,22 +933,20 @@ mod tests {
             db.execute(&format!("INSERT INTO vault VALUES ('alice', '{secret}')"))
                 .unwrap();
         }
-        // Scan every file in the data directory for the plaintext.
+        // Scan every file in the data directory: no value, no column
+        // name and — since v2 — no table name may appear in plaintext.
         for entry in std::fs::read_dir(dir.path()).unwrap() {
             let path = entry.unwrap().path();
             let bytes = std::fs::read(&path).unwrap();
+            for needle in ["alice", "owner", "secret", "vault"] {
+                assert!(
+                    !contains_subslice(&bytes, needle.as_bytes()),
+                    "plaintext {needle:?} leaked into {path:?}"
+                );
+            }
             assert!(
                 !contains_subslice(&bytes, secret.as_bytes()),
-                "plaintext secret leaked into {path:?}"
-            );
-            assert!(
-                !contains_subslice(&bytes, b"alice"),
-                "plaintext value leaked into {path:?}"
-            );
-            // Table and column names are sealed inside the catalog too.
-            assert!(
-                !contains_subslice(&bytes, b"owner"),
-                "column name leaked into {path:?}"
+                "secret value leaked into {path:?}"
             );
         }
         // And yet the data is fully queryable with the right key.
@@ -658,12 +954,19 @@ mod tests {
         let results = db
             .execute("SELECT secret FROM vault WHERE owner = 'alice'")
             .unwrap();
+        assert_eq!(rows_of(results), vec![vec![text(secret)]]);
+        assert_eq!(db.tables().unwrap(), vec!["vault".to_string()]);
+    }
+
+    #[test]
+    fn tables_are_listed_by_decrypting_the_catalog() {
+        let dir = ciphra_testutil::tempdir();
+        let mut db = engine(dir.path());
+        db.execute("CREATE TABLE zebra (a INT); CREATE TABLE apple (a INT);")
+            .unwrap();
         assert_eq!(
-            results,
-            vec![QueryResult::Rows {
-                columns: vec!["secret".into()],
-                rows: vec![vec![Value::Text(secret.into())]],
-            }]
+            db.tables().unwrap(),
+            vec!["apple".to_string(), "zebra".to_string()]
         );
     }
 
@@ -720,13 +1023,9 @@ mod tests {
         assert!(db.tables().unwrap().is_empty());
         // Recreating the table must start from a clean slate.
         db.execute("CREATE TABLE t (a INT)").unwrap();
-        let results = db.execute("SELECT * FROM t").unwrap();
         assert_eq!(
-            results,
-            vec![QueryResult::Rows {
-                columns: vec!["a".into()],
-                rows: vec![]
-            }]
+            rows_of(db.execute("SELECT * FROM t").unwrap()),
+            Vec::<Vec<Value>>::new()
         );
     }
 
