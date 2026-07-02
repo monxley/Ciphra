@@ -36,6 +36,9 @@ later.
 
 ## Phase 2 — The crypto features that justify the name
 
+- [x] Group commit: one fsync + one atomic (all-or-nothing) WAL
+      record per statement — 34x on inserts, crash-atomic statements
+
 - [ ] Queryable encryption layers with an explicit, documented leakage
       profile (equality via deterministic tags; range via order-revealing
       structures — opt-in per column, never silent)

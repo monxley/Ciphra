@@ -24,9 +24,11 @@ computing base explicit: anything that can see plaintext lives in
 
 A single write-ahead log plus an in-memory `BTreeMap`.
 
-- Record: `crc32(payload) | len | payload`, payload = op, key, value.
-- Every mutation is appended and fsynced before the in-memory table is
-  updated; a put/delete that returned `Ok` is durable.
+- Record: `crc32(payload) | len | payload`; a payload is one put/delete
+  or a *batch* of them (`Storage::commit`), which is how the engine
+  writes every SQL statement: one WAL record, one fsync, and — because
+  the whole batch sits under one checksum — all-or-nothing replay.
+  A mutation that returned `Ok` is durable.
 - On open the log is replayed; a checksum failure or truncated record
   marks the torn tail from a crash, which is cut off.
 - `compact()` rewrites the log to the live state via tmp-file + rename.
@@ -166,5 +168,6 @@ indexed column across rows (like deterministic encryption) — that is
 why indexes are opt-in per column and never created silently. PK values
 are unique among live rows, so their tags repeat only across
 delete/re-insert cycles. `INSERT` validates a whole batch (types,
-arity, PK) before writing anything; row + index writes are not atomic
-under crash, and a dangling index entry reads as absent.
+arity, PK) before writing anything, and every statement commits as one
+atomic WAL record — rows, index entries and sequence together. Readers
+still treat a dangling index entry as absent, as defense in depth.

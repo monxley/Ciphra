@@ -2,7 +2,7 @@
 
 Honest numbers, encryption cost included. There is no "fast mode" to
 quietly compare against: whole-row ChaCha20-Poly1305, keyed index tags
-and one fsync per storage write are the only path.
+and one durable fsync per statement (group commit) are the only path.
 
 ## Running
 
@@ -23,24 +23,25 @@ order of magnitude, not a datasheet; run the harness on your hardware.
 | Operation | Throughput |
 |---|---|
 | Argon2id open (19 MiB, t=2) — one-time | ~110 ms |
-| `INSERT` (batches of 100) | ~390 rows/s |
+| `INSERT` (batches of 100) | ~13,000 rows/s |
 | `SELECT` by PRIMARY KEY | ~42,000 ops/s |
 | `SELECT` by secondary index (~100 hits) | ~1,500 ops/s (~150k rows/s decrypted) |
 | `SELECT` full scan + filter (10k rows) | ~62 scans/s (~600k rows/s decrypted) |
-| `UPDATE` by PRIMARY KEY | ~1,100 ops/s |
-| `DELETE` by PRIMARY KEY | ~370 ops/s |
+| `UPDATE` by PRIMARY KEY | ~1,300 ops/s |
+| `DELETE` by PRIMARY KEY | ~1,100 ops/s |
 
 ## Reading the numbers
 
 - **Reads are already respectable.** Point lookups cost two storage
   reads plus two ChaCha20-Poly1305 opens; scans decrypt ~600k rows/s
   even with the deliberately simple byte-limb Poly1305.
-- **Writes are fsync-bound, not crypto-bound.** One durable fsync per
-  storage `put`, and a single inserted row touches the row record, two
-  index entries and the sequence — four syncs. Group commit (one fsync
-  per statement or per batch) is the known fix and sits on the roadmap
-  next to transactions; it should move inserts by an order of
-  magnitude without touching the encryption model.
+- **Group commit moved inserts 34x.** v0 paid one fsync per storage
+  `put` (four per inserted row) and managed ~390 rows/s; batching every
+  statement into a single checksummed WAL record with one fsync raised
+  that to ~13,000 rows/s without touching the encryption model — and
+  made statements crash-atomic as a side effect (a torn batch fails its
+  CRC and is dropped whole). Remaining write cost is dominated by the
+  one honest fsync per statement.
 - **The KDF cost is a feature.** ~110 ms of memory-hard work per
   database open is what makes passphrase brute force expensive; it is
   paid once per process, not per query.

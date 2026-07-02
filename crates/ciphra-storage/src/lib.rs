@@ -21,6 +21,10 @@ use std::sync::OnceLock;
 pub const WAL_FILE: &str = "ciphra.wal";
 const OP_PUT: u8 = 1;
 const OP_DELETE: u8 = 2;
+/// A group of puts/deletes inside one checksummed record: committed with
+/// a single fsync and replayed all-or-nothing (a torn batch fails its
+/// CRC and is dropped whole).
+const OP_BATCH: u8 = 3;
 
 /// Errors produced by the storage layer.
 #[derive(Debug)]
@@ -78,15 +82,17 @@ impl Storage {
         let mut pos = 0usize;
         while pos < buf.len() {
             match decode_record(&buf[pos..]) {
-                Some((consumed, op, key, value)) => {
-                    match op {
-                        OP_PUT => {
-                            map.insert(key, value);
-                        }
-                        OP_DELETE => {
-                            map.remove(&key);
-                        }
-                        _ => break, // unknown opcode: treat as torn tail
+                Some((consumed, Record::Single(op, key, value))) => {
+                    if !apply_op(&mut map, op, key, value) {
+                        break; // unknown opcode: treat as torn tail
+                    }
+                    pos += consumed;
+                }
+                Some((consumed, Record::Batch(entries))) => {
+                    // The whole batch sits under one CRC, so it is
+                    // either fully present here or was dropped above.
+                    for (op, key, value) in entries {
+                        apply_op(&mut map, op, key, value);
                     }
                     pos += consumed;
                 }
@@ -112,6 +118,31 @@ impl Storage {
     pub fn delete(&mut self, key: &[u8]) -> Result<()> {
         self.append(OP_DELETE, key, &[])?;
         self.map.remove(key);
+        Ok(())
+    }
+
+    /// Apply a batch of mutations with one WAL record and one fsync.
+    ///
+    /// Group commit and crash atomicity in one: the whole batch is
+    /// covered by a single checksum, so after a crash it is either
+    /// fully applied or fully absent — never partial.
+    pub fn commit(&mut self, batch: Batch) -> Result<()> {
+        match batch.entries.len() {
+            0 => return Ok(()),
+            1 => {
+                // A single-op batch is just a plain record.
+                let (op, key, value) = batch.entries.into_iter().next().unwrap();
+                self.append(op, &key, &value)?;
+                apply_op(&mut self.map, op, key, value);
+                return Ok(());
+            }
+            _ => {}
+        }
+        self.wal.write_all(&encode_batch_record(&batch.entries))?;
+        self.wal.sync_data()?;
+        for (op, key, value) in batch.entries {
+            apply_op(&mut self.map, op, key, value);
+        }
         Ok(())
     }
 
@@ -162,6 +193,56 @@ impl Storage {
     }
 }
 
+/// A group of mutations to be committed together via [`Storage::commit`].
+#[derive(Default)]
+pub struct Batch {
+    entries: Vec<(u8, Vec<u8>, Vec<u8>)>,
+}
+
+impl Batch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn put(&mut self, key: &[u8], value: &[u8]) {
+        self.entries.push((OP_PUT, key.to_vec(), value.to_vec()));
+    }
+
+    pub fn delete(&mut self, key: &[u8]) {
+        self.entries.push((OP_DELETE, key.to_vec(), Vec::new()));
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// A decoded WAL record.
+enum Record {
+    Single(u8, Vec<u8>, Vec<u8>),
+    Batch(Vec<(u8, Vec<u8>, Vec<u8>)>),
+}
+
+/// Apply one operation to the in-memory table. Returns false for an
+/// unknown opcode.
+fn apply_op(map: &mut BTreeMap<Vec<u8>, Vec<u8>>, op: u8, key: Vec<u8>, value: Vec<u8>) -> bool {
+    match op {
+        OP_PUT => {
+            map.insert(key, value);
+            true
+        }
+        OP_DELETE => {
+            map.remove(&key);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Record layout: `crc32(payload) (4 LE) | payload_len (4 LE) | payload`
 /// where `payload = op (1) | key_len (4 LE) | key | value_len (4 LE) | value`.
 fn encode_record(op: u8, key: &[u8], value: &[u8]) -> Vec<u8> {
@@ -180,35 +261,88 @@ fn encode_record(op: u8, key: &[u8], value: &[u8]) -> Vec<u8> {
     record
 }
 
+/// Batch record layout: `crc32 | payload_len | payload` where
+/// `payload = OP_BATCH (1) | count (4 LE)` followed by `count` entries of
+/// `sub_op (1) | key_len (4 LE) | key | value_len (4 LE) | value`.
+fn encode_batch_record(entries: &[(u8, Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    let mut payload = vec![OP_BATCH];
+    payload.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (op, key, value) in entries {
+        payload.push(*op);
+        payload.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        payload.extend_from_slice(key);
+        payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        payload.extend_from_slice(value);
+    }
+
+    let mut record = Vec::with_capacity(8 + payload.len());
+    record.extend_from_slice(&crc32(&payload).to_le_bytes());
+    record.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    record.extend_from_slice(&payload);
+    record
+}
+
 /// Decode one record from the front of `buf`.
-/// Returns `(bytes_consumed, op, key, value)`, or `None` if the record is
-/// truncated or fails its checksum.
-fn decode_record(buf: &[u8]) -> Option<(usize, u8, Vec<u8>, Vec<u8>)> {
+/// Returns `(bytes_consumed, record)`, or `None` if the record is
+/// truncated, malformed, or fails its checksum.
+fn decode_record(buf: &[u8]) -> Option<(usize, Record)> {
     if buf.len() < 8 {
         return None;
     }
     let crc = u32::from_le_bytes(buf[0..4].try_into().unwrap());
     let payload_len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
-    if buf.len() < 8 + payload_len || payload_len < 9 {
+    if buf.len() < 8 + payload_len || payload_len < 5 {
         return None;
     }
     let payload = &buf[8..8 + payload_len];
     if crc32(payload) != crc {
         return None;
     }
-    let op = payload[0];
-    let key_len = u32::from_le_bytes(payload[1..5].try_into().unwrap()) as usize;
-    if payload.len() < 5 + key_len + 4 {
+    let consumed = 8 + payload_len;
+
+    if payload[0] == OP_BATCH {
+        let count = u32::from_le_bytes(payload[1..5].try_into().unwrap()) as usize;
+        let mut entries = Vec::with_capacity(count);
+        let mut pos = 5usize;
+        for _ in 0..count {
+            let (entry, advanced) = decode_entry(&payload[pos..])?;
+            entries.push(entry);
+            pos += advanced;
+        }
+        if pos != payload.len() {
+            return None;
+        }
+        return Some((consumed, Record::Batch(entries)));
+    }
+
+    let ((op, key, value), advanced) = decode_entry(payload)?;
+    if advanced != payload.len() {
         return None;
     }
-    let key = payload[5..5 + key_len].to_vec();
+    Some((consumed, Record::Single(op, key, value)))
+}
+
+/// Decode one `op | key_len | key | value_len | value` entry from the
+/// front of `buf`, returning it with the number of bytes consumed.
+#[allow(clippy::type_complexity)]
+fn decode_entry(buf: &[u8]) -> Option<((u8, Vec<u8>, Vec<u8>), usize)> {
+    if buf.len() < 9 {
+        return None;
+    }
+    let op = buf[0];
+    let key_len = u32::from_le_bytes(buf[1..5].try_into().unwrap()) as usize;
     let vstart = 5 + key_len;
-    let value_len = u32::from_le_bytes(payload[vstart..vstart + 4].try_into().unwrap()) as usize;
-    if payload.len() != vstart + 4 + value_len {
+    if buf.len() < vstart + 4 {
         return None;
     }
-    let value = payload[vstart + 4..].to_vec();
-    Some((8 + payload_len, op, key, value))
+    let key = buf[5..vstart].to_vec();
+    let value_len = u32::from_le_bytes(buf[vstart..vstart + 4].try_into().unwrap()) as usize;
+    let end = vstart + 4 + value_len;
+    if buf.len() < end {
+        return None;
+    }
+    let value = buf[vstart + 4..end].to_vec();
+    Some(((op, key, value), end))
 }
 
 static CRC_TABLE: OnceLock<[u32; 256]> = OnceLock::new();
@@ -308,6 +442,67 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0], (&b"t/users/1"[..], &b"alice"[..]));
         assert_eq!(hits[1], (&b"t/users/2"[..], &b"bob"[..]));
+    }
+
+    #[test]
+    fn batch_commit_applies_all_and_survives_reopen() {
+        let dir = ciphra_testutil::tempdir();
+        {
+            let mut db = Storage::open(dir.path()).unwrap();
+            db.put(b"pre", b"existing").unwrap();
+            let mut batch = Batch::new();
+            batch.put(b"a", b"1");
+            batch.put(b"b", b"2");
+            batch.delete(b"pre");
+            batch.put(b"a", b"1-final"); // later entries win
+            db.commit(batch).unwrap();
+            assert_eq!(db.get(b"a"), Some(&b"1-final"[..]));
+            assert_eq!(db.get(b"pre"), None);
+        }
+        let db = Storage::open(dir.path()).unwrap();
+        assert_eq!(db.get(b"a"), Some(&b"1-final"[..]));
+        assert_eq!(db.get(b"b"), Some(&b"2"[..]));
+        assert_eq!(db.get(b"pre"), None);
+        assert_eq!(db.len(), 2);
+    }
+
+    #[test]
+    fn torn_batch_is_dropped_whole() {
+        let dir = ciphra_testutil::tempdir();
+        {
+            let mut db = Storage::open(dir.path()).unwrap();
+            db.put(b"stable", b"before").unwrap();
+            let mut batch = Batch::new();
+            batch.put(b"x", b"1");
+            batch.put(b"y", b"2");
+            db.commit(batch).unwrap();
+        }
+        // Cut the file mid-batch-record: the batch must vanish entirely,
+        // never apply partially.
+        let wal_path = dir.path().join(WAL_FILE);
+        let len = fs::metadata(&wal_path).unwrap().len();
+        let wal = OpenOptions::new().write(true).open(&wal_path).unwrap();
+        wal.set_len(len - 5).unwrap();
+        drop(wal);
+
+        let db = Storage::open(dir.path()).unwrap();
+        assert_eq!(db.get(b"stable"), Some(&b"before"[..]));
+        assert_eq!(db.get(b"x"), None);
+        assert_eq!(db.get(b"y"), None);
+    }
+
+    #[test]
+    fn empty_and_single_batches() {
+        let dir = ciphra_testutil::tempdir();
+        let mut db = Storage::open(dir.path()).unwrap();
+        db.commit(Batch::new()).unwrap();
+        assert!(db.is_empty());
+        let mut batch = Batch::new();
+        batch.put(b"only", b"one");
+        db.commit(batch).unwrap();
+        drop(db);
+        let db = Storage::open(dir.path()).unwrap();
+        assert_eq!(db.get(b"only"), Some(&b"one"[..]));
     }
 
     #[test]
