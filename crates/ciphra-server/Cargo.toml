@@ -1,0 +1,16 @@
+[package]
+name = "ciphra-server"
+description = "Ciphra storage server: stores sealed bytes it cannot read"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "ciphra-server"
+path = "src/main.rs"
+
+[dependencies]
+ciphra-net.workspace = true
+ciphra-storage.workspace = true
