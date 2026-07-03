@@ -31,6 +31,9 @@ specifications and gated by official test vectors:
 | HKDF | RFC 5869 | RFC 5869 |
 | PBKDF2 | RFC 8018 | RFC 7914 §11 |
 | ChaCha20, Poly1305, AEAD | RFC 8439 | RFC 8439 |
+| SHA-3, SHAKE | FIPS 202 | NIST |
+| X25519 | RFC 7748 | RFC 7748 |
+| ML-KEM-768 | FIPS 203 | round-trip + NTT-vs-convolution (ACVP pending) |
 
 AEAD is ChaCha20-Poly1305 rather than AES-GCM deliberately: a plain
 software ChaCha20 has no secret-indexed memory accesses (add-rotate-xor

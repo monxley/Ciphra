@@ -14,3 +14,4 @@ path = "src/main.rs"
 [dependencies]
 ciphra-net.workspace = true
 ciphra-storage.workspace = true
+ciphra-crypto.workspace = true

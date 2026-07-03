@@ -9,6 +9,7 @@ authors.workspace = true
 
 [dependencies]
 ciphra-storage.workspace = true
+ciphra-crypto.workspace = true
 
 [dev-dependencies]
 ciphra-testutil.workspace = true

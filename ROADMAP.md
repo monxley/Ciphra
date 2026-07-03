@@ -61,10 +61,13 @@ later.
       `ciphra-server` binary + `--remote` client; plaintext and keys
       never cross the wire
 - [ ] Python/JS/Go drivers (engine as a library over this protocol)
-- [ ] Transport security on the framing boundary (then ML-KEM)
+- [x] Transport security: hybrid X25519 + ML-KEM-768 handshake
+      (SHA-3/SHAKE, X25519 RFC 7748, ML-KEM-768 FIPS 203 — all from
+      scratch), forward-secret + server-authenticated encrypted
+      channel; `--server-key` pinning
 - [ ] Replication (log shipping first)
-- [ ] Post-quantum transport: ML-KEM key exchange, ML-DSA-signed
-      audit roots
+- [x] Post-quantum key exchange (ML-KEM) — done in the transport above
+- [ ] ML-DSA-signed audit roots (post-quantum signatures)
 - [ ] Optional build against audited crypto implementations
 - [ ] External security audit — a release blocker for 1.0
 

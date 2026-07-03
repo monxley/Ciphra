@@ -141,6 +141,37 @@ planned upgrade for large ones. Queries pay one blob decrypt and then
 fetch only matching rows. Indexes of both kinds are opt-in per column,
 never created silently.
 
+### Transport security (hybrid post-quantum)
+
+Remote connections (`ciphra-server` ↔ `ciphra --remote`) open with a
+hybrid handshake and are encrypted thereafter. Three shared secrets are
+mixed so the channel holds if *any* one primitive survives:
+
+- **dh_e** — ephemeral×ephemeral X25519: forward secrecy.
+- **dh_s** — client-ephemeral × server-static X25519: authenticates the
+  server (only the holder of the pinned static key derives it). The
+  server prints this static key; clients pin it with `--server-key`.
+  Without a pin the channel is still encrypted and post-quantum but
+  unauthenticated (MITM-exposed) — and says so.
+- **ss_pq** — ML-KEM-768 (FIPS 203): post-quantum confidentiality,
+  defeating harvest-now-decrypt-later.
+
+`channel_key = SHA3-256("ciphra/transport/v1" ∥ dh_e ∥ dh_s ∥ ss_pq ∥
+transcript)`; the transcript binds every handshake byte. Each direction
+then seals frames with ChaCha20-Poly1305 under its own subkey and a
+monotonic counter nonce, so reordering or replay fails authentication.
+The static transport key authenticates the server but **cannot decrypt
+stored data** — it is unrelated to the passphrase-derived data keys, so
+the server stays blind (ADR-0003).
+
+Honesty note on ML-KEM: it is implemented from FIPS 203's clean
+formulation and verified here for internal consistency — the NTT is
+checked against a schoolbook negacyclic convolution (pinning every zeta
+and gamma) and the full KEM round-trips with implicit rejection. This
+build has no network to pull the official ACVP known-answer vectors, so
+byte-exact cross-implementation interop is on the audit checklist, not
+yet claimed.
+
 ### Why hand-written primitives?
 
 The core is dependency-free by policy (see ADR-0002): for an encrypted

@@ -73,10 +73,10 @@ rather than add-ons.
   (HMAC under a master-derived key); the real name lives only inside
   the sealed catalog record.
 - **Zero third-party dependencies.** The entire engine — including
-  SHA-256, HMAC, HKDF, PBKDF2, ChaCha20, Poly1305, BLAKE2b and
-  Argon2id — is implemented in this repository and verified against
-  official RFC/NIST test vectors. The supply chain is: the Rust
-  standard library, and this repo.
+  SHA-256, HMAC, HKDF, PBKDF2, ChaCha20, Poly1305, BLAKE2b, Argon2id,
+  SHA-3/SHAKE, X25519 and ML-KEM-768 — is implemented in this
+  repository and verified against official RFC/NIST/FIPS test vectors.
+  The supply chain is: the Rust standard library, and this repo.
 - **Vector search over encrypted embeddings**: `VECTOR(dim)` columns
   and `ORDER BY emb NEAREST TO [0.1, ...] LIMIT k` — exact cosine
   similarity computed over sealed rows, so Ciphra doubles as an
@@ -90,10 +90,12 @@ rather than add-ons.
   index tags) with an atomic file swap — a crash cannot strand the
   database between two keys.
 - **Client/server with a blind server** (`ciphra-server` +
-  `ciphra --remote host:port`): the server stores sealed bytes and has
-  no dependency on the crypto crate at all — it *cannot* decrypt, not
-  merely does not. SQL, keys and plaintext never leave the client
-  (ADR-0003).
+  `ciphra --remote host:port`): the server stores sealed bytes and
+  *cannot* decrypt them. The connection runs a **hybrid post-quantum
+  handshake** — X25519 + ML-KEM-768, all implemented from scratch — so
+  the channel is forward-secret, server-authenticated (pin the printed
+  key with `--server-key`), and safe against harvest-now-decrypt-later.
+  SQL, keys and plaintext never leave the client (ADR-0003).
 - **Sealed backup/restore**: `--backup file` exports one
   self-contained encrypted snapshot (audit chain included);
   `--restore file` verifies the passphrase and the chain before use.

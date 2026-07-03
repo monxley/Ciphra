@@ -36,6 +36,7 @@ dependencies = [
 name = "ciphra-net"
 version = "0.0.1"
 dependencies = [
+ "ciphra-crypto",
  "ciphra-storage",
  "ciphra-testutil",
 ]
@@ -44,6 +45,7 @@ dependencies = [
 name = "ciphra-server"
 version = "0.0.1"
 dependencies = [
+ "ciphra-crypto",
  "ciphra-net",
  "ciphra-storage",
 ]

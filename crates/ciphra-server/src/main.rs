@@ -8,6 +8,7 @@ use std::net::TcpListener;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
+use ciphra_crypto::ServerIdentity;
 use ciphra_storage::Storage;
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:5077";
@@ -57,8 +58,41 @@ and every byte that crosses the wire or touches this disk is ciphertext."
     }
 
     let storage = Storage::open(&data_dir).map_err(|e| e.to_string())?;
+
+    // Load or create the static transport identity — the key clients
+    // pin. It authenticates the server; it does NOT decrypt stored data.
+    let (secret, public) = load_or_create_identity(&data_dir)?;
+
     let listener = TcpListener::bind(&listen).map_err(|e| e.to_string())?;
     println!("ciphra-server: serving sealed storage from {data_dir} on {listen}");
-    println!("(this process has no keys and cannot decrypt what it stores)");
-    ciphra_net::serve(listener, Arc::new(Mutex::new(storage))).map_err(|e| e.to_string())
+    println!("(this process has no data keys and cannot decrypt what it stores)");
+    println!("transport handshake: hybrid X25519 + ML-KEM-768");
+    println!(
+        "server key (pin this on clients with --server-key):\n  {}",
+        hex(&public)
+    );
+    ciphra_net::serve(listener, Arc::new(Mutex::new(storage)), secret).map_err(|e| e.to_string())
+}
+
+const IDENTITY_FILE: &str = "ciphra.serverkey";
+
+fn load_or_create_identity(data_dir: &str) -> Result<([u8; 32], [u8; 32]), String> {
+    let path = std::path::Path::new(data_dir).join(IDENTITY_FILE);
+    let secret: [u8; 32] = if path.exists() {
+        std::fs::read(&path)
+            .map_err(|e| e.to_string())?
+            .try_into()
+            .map_err(|_| format!("{IDENTITY_FILE} is not a 32-byte key"))?
+    } else {
+        let identity = ServerIdentity::generate();
+        let secret = identity.secret_bytes();
+        std::fs::write(&path, secret).map_err(|e| e.to_string())?;
+        secret
+    };
+    let public = ServerIdentity::from_secret(secret).public;
+    Ok((secret, public))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
