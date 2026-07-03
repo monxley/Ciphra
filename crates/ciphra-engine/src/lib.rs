@@ -57,8 +57,8 @@ pub use codec::TableSchema;
 use ciphra_crypto::{CipherKey, CryptoError, MasterKey};
 use ciphra_net::RemoteStorage;
 use ciphra_sql::{
-    AggArg, AggFunc, Assignment, CmpOp, Expr, Limit, Literal, OrderBy, ParseError, Projection,
-    SelectItem, Statement,
+    AggArg, AggFunc, Assignment, CmpOp, Expr, HavingExpr, HavingTerm, Limit, Literal, OrderBy,
+    ParseError, Projection, SelectItem, Statement,
 };
 use ciphra_storage::{Batch, Storage, StorageError};
 
@@ -992,9 +992,12 @@ impl Engine {
                 table,
                 predicate,
                 group_by,
+                having,
                 order_by,
                 limit,
-            } => self.select(&table, columns, predicate, group_by, order_by, limit),
+            } => self.select(
+                &table, columns, predicate, group_by, having, order_by, limit,
+            ),
             Statement::Update {
                 table,
                 assignments,
@@ -1377,20 +1380,22 @@ impl Engine {
         Ok(QueryResult::Inserted(count))
     }
 
+    #[allow(clippy::too_many_arguments)] // one per SELECT clause; a struct would not read clearer
     fn select(
         &mut self,
         table: &str,
         projection: Projection,
         predicate: Option<Expr>,
         group_by: Vec<String>,
+        having: Option<HavingExpr>,
         order_by: Option<OrderBy>,
         limit: Option<Limit>,
     ) -> Result<QueryResult> {
         let schema = self.expect_schema(table)?;
         let filter = predicate.map(|p| compile_expr(&schema, p)).transpose()?;
 
-        // Aggregate / GROUP BY queries take a separate path: collect the
-        // filtered rows, then fold them into groups.
+        // Aggregate / GROUP BY / HAVING queries take a separate path:
+        // collect the filtered rows, then fold them into groups.
         if let Projection::Items(items) = &projection {
             if order_by.is_some() {
                 return Err(EngineError::Schema(
@@ -1407,7 +1412,7 @@ impl Engine {
                 }
                 rows.push(row);
             }
-            return aggregate(&schema, table, items, &group_by, rows, limit);
+            return aggregate(&schema, table, items, &group_by, having, rows, limit);
         }
 
         let output: Vec<usize> = match &projection {
@@ -2031,6 +2036,7 @@ fn aggregate(
     table: &str,
     items: &[SelectItem],
     group_by: &[String],
+    having: Option<HavingExpr>,
     rows: Vec<Vec<Value>>,
     limit: Option<Limit>,
 ) -> Result<QueryResult> {
@@ -2051,65 +2057,22 @@ fn aggregate(
     for item in items {
         match item {
             SelectItem::Column(name) => {
-                let pos = group_by.iter().position(|g| g == name).ok_or_else(|| {
-                    EngineError::Schema(format!(
-                        "column {name:?} must appear in GROUP BY or inside an aggregate"
-                    ))
-                })?;
-                plans.push(AggPlan::GroupCol(pos));
+                plans.push(AggPlan::GroupCol(group_col_pos(group_by, name)?));
                 names.push(name.clone());
             }
             SelectItem::Aggregate { func, arg } => {
-                let (plan, arg_name) = match arg {
-                    AggArg::Star => (AggPlan::Count(None), "*".to_string()),
-                    AggArg::Column(col) => {
-                        let idx = schema.column_index(col).ok_or_else(|| {
-                            EngineError::Schema(format!(
-                                "unknown column {col:?} in table {table:?}"
-                            ))
-                        })?;
-                        let ty = schema.columns[idx].ty;
-                        let plan = match func {
-                            AggFunc::Count => AggPlan::Count(Some(idx)),
-                            AggFunc::Sum => match ty {
-                                DataType::Int => AggPlan::SumInt(idx),
-                                DataType::Real => AggPlan::SumReal(idx),
-                                _ => {
-                                    return Err(EngineError::Type(format!(
-                                        "SUM({col}) requires an INT or REAL column"
-                                    )));
-                                }
-                            },
-                            AggFunc::Avg => {
-                                if !matches!(ty, DataType::Int | DataType::Real) {
-                                    return Err(EngineError::Type(format!(
-                                        "AVG({col}) requires an INT or REAL column"
-                                    )));
-                                }
-                                AggPlan::Avg(idx)
-                            }
-                            AggFunc::Min | AggFunc::Max => {
-                                if matches!(ty, DataType::Vector(_)) {
-                                    return Err(EngineError::Type(format!(
-                                        "{}({col}) is not defined on a VECTOR column",
-                                        func.name()
-                                    )));
-                                }
-                                if matches!(func, AggFunc::Min) {
-                                    AggPlan::Min(idx)
-                                } else {
-                                    AggPlan::Max(idx)
-                                }
-                            }
-                        };
-                        (plan, col.clone())
-                    }
-                };
-                names.push(format!("{}({})", func.name(), arg_name));
-                plans.push(plan);
+                plans.push(resolve_aggregate(schema, table, *func, arg)?);
+                names.push(aggregate_name(*func, arg));
             }
         }
     }
+
+    // Projection output columns are the first `output_len` plans; HAVING
+    // may append further plans it needs but that aren't selected.
+    let output_len = plans.len();
+    let compiled_having = having
+        .map(|h| compile_having(&h, schema, table, group_by, &mut plans))
+        .transpose()?;
 
     let init = |plans: &[AggPlan]| -> Vec<AggAcc> {
         plans
@@ -2227,40 +2190,21 @@ fn aggregate(
 
     let mut out_rows = Vec::with_capacity(groups.len());
     for (keyvals, accs) in &groups {
-        let mut row = Vec::with_capacity(plans.len());
-        for (plan, acc) in plans.iter().zip(accs.iter()) {
-            let value = match (plan, acc) {
-                (AggPlan::GroupCol(pos), _) => keyvals[*pos].clone(),
-                (_, AggAcc::Count(c)) => Value::Int(*c),
-                (_, AggAcc::SumInt { total, any }) => {
-                    if *any {
-                        Value::Int(i64::try_from(*total).map_err(|_| {
-                            EngineError::Type("SUM overflowed a 64-bit integer".into())
-                        })?)
-                    } else {
-                        Value::Null
-                    }
-                }
-                (_, AggAcc::SumReal { total, any }) => {
-                    if *any {
-                        Value::Real(*total)
-                    } else {
-                        Value::Null
-                    }
-                }
-                (_, AggAcc::Avg { total, count }) => {
-                    if *count > 0 {
-                        Value::Real(*total / *count as f64)
-                    } else {
-                        Value::Null
-                    }
-                }
-                (_, AggAcc::Extreme(v)) => v.clone().unwrap_or(Value::Null),
-                _ => unreachable!("plan and accumulator are built in lockstep"),
-            };
-            row.push(value);
+        // Finalize every plan (projected and HAVING-only).
+        let computed: Vec<Value> = plans
+            .iter()
+            .zip(accs.iter())
+            .map(|(plan, acc)| finalize_plan(plan, acc, keyvals))
+            .collect::<Result<_>>()?;
+
+        // Drop the group unless HAVING evaluates to true.
+        if let Some(h) = &compiled_having
+            && eval_having(h, &computed, keyvals) != Some(true)
+        {
+            continue;
         }
-        out_rows.push(row);
+
+        out_rows.push(computed[..output_len].to_vec());
     }
 
     let out_rows = match limit {
@@ -2275,6 +2219,223 @@ fn aggregate(
         columns: names,
         rows: out_rows,
     })
+}
+
+/// Position of `name` within the `GROUP BY` columns, or an error.
+fn group_col_pos(group_by: &[String], name: &str) -> Result<usize> {
+    group_by.iter().position(|g| g == name).ok_or_else(|| {
+        EngineError::Schema(format!(
+            "column {name:?} must appear in GROUP BY or inside an aggregate"
+        ))
+    })
+}
+
+/// The canonical output-column name for an aggregate, e.g. `SUM(salary)`.
+fn aggregate_name(func: AggFunc, arg: &AggArg) -> String {
+    let arg_name = match arg {
+        AggArg::Star => "*",
+        AggArg::Column(col) => col,
+    };
+    format!("{}({})", func.name(), arg_name)
+}
+
+/// Resolve one aggregate `func(arg)` to a plan, type-checking the column.
+fn resolve_aggregate(
+    schema: &TableSchema,
+    table: &str,
+    func: AggFunc,
+    arg: &AggArg,
+) -> Result<AggPlan> {
+    let col = match arg {
+        AggArg::Star => return Ok(AggPlan::Count(None)),
+        AggArg::Column(col) => col,
+    };
+    let idx = schema
+        .column_index(col)
+        .ok_or_else(|| EngineError::Schema(format!("unknown column {col:?} in table {table:?}")))?;
+    let ty = schema.columns[idx].ty;
+    Ok(match func {
+        AggFunc::Count => AggPlan::Count(Some(idx)),
+        AggFunc::Sum => match ty {
+            DataType::Int => AggPlan::SumInt(idx),
+            DataType::Real => AggPlan::SumReal(idx),
+            _ => {
+                return Err(EngineError::Type(format!(
+                    "SUM({col}) requires an INT or REAL column"
+                )));
+            }
+        },
+        AggFunc::Avg => {
+            if !matches!(ty, DataType::Int | DataType::Real) {
+                return Err(EngineError::Type(format!(
+                    "AVG({col}) requires an INT or REAL column"
+                )));
+            }
+            AggPlan::Avg(idx)
+        }
+        AggFunc::Min | AggFunc::Max => {
+            if matches!(ty, DataType::Vector(_)) {
+                return Err(EngineError::Type(format!(
+                    "{}({col}) is not defined on a VECTOR column",
+                    func.name()
+                )));
+            }
+            if matches!(func, AggFunc::Min) {
+                AggPlan::Min(idx)
+            } else {
+                AggPlan::Max(idx)
+            }
+        }
+    })
+}
+
+/// Finalize one plan's accumulator into its output value for a group.
+fn finalize_plan(plan: &AggPlan, acc: &AggAcc, keyvals: &[Value]) -> Result<Value> {
+    Ok(match (plan, acc) {
+        (AggPlan::GroupCol(pos), _) => keyvals[*pos].clone(),
+        (_, AggAcc::Count(c)) => Value::Int(*c),
+        (_, AggAcc::SumInt { total, any }) => {
+            if *any {
+                Value::Int(
+                    i64::try_from(*total)
+                        .map_err(|_| EngineError::Type("SUM overflowed a 64-bit integer".into()))?,
+                )
+            } else {
+                Value::Null
+            }
+        }
+        (_, AggAcc::SumReal { total, any }) => {
+            if *any {
+                Value::Real(*total)
+            } else {
+                Value::Null
+            }
+        }
+        (_, AggAcc::Avg { total, count }) => {
+            if *count > 0 {
+                Value::Real(*total / *count as f64)
+            } else {
+                Value::Null
+            }
+        }
+        (_, AggAcc::Extreme(v)) => v.clone().unwrap_or(Value::Null),
+        _ => unreachable!("plan and accumulator are built in lockstep"),
+    })
+}
+
+/// A resolved `HAVING` operand: a group-key column or a computed plan.
+enum HavingRef {
+    GroupKey(usize),
+    Plan(usize),
+}
+
+/// A compiled `HAVING` predicate, evaluated per group.
+enum CompiledHaving {
+    Compare {
+        left: HavingRef,
+        op: CmpOp,
+        value: Value,
+    },
+    Not(Box<CompiledHaving>),
+    And(Box<CompiledHaving>, Box<CompiledHaving>),
+    Or(Box<CompiledHaving>, Box<CompiledHaving>),
+}
+
+/// Compile a `HAVING` predicate, appending any aggregates it needs (but
+/// that aren't selected) to `plans`.
+fn compile_having(
+    expr: &HavingExpr,
+    schema: &TableSchema,
+    table: &str,
+    group_by: &[String],
+    plans: &mut Vec<AggPlan>,
+) -> Result<CompiledHaving> {
+    Ok(match expr {
+        HavingExpr::Compare { term, op, value } => {
+            let left = match term {
+                HavingTerm::Column(name) => HavingRef::GroupKey(group_col_pos(group_by, name)?),
+                HavingTerm::Aggregate { func, arg } => {
+                    let plan = resolve_aggregate(schema, table, *func, arg)?;
+                    plans.push(plan);
+                    HavingRef::Plan(plans.len() - 1)
+                }
+            };
+            CompiledHaving::Compare {
+                left,
+                op: *op,
+                value: literal_to_value(value.clone()),
+            }
+        }
+        HavingExpr::Not(inner) => CompiledHaving::Not(Box::new(compile_having(
+            inner, schema, table, group_by, plans,
+        )?)),
+        HavingExpr::And(a, b) => CompiledHaving::And(
+            Box::new(compile_having(a, schema, table, group_by, plans)?),
+            Box::new(compile_having(b, schema, table, group_by, plans)?),
+        ),
+        HavingExpr::Or(a, b) => CompiledHaving::Or(
+            Box::new(compile_having(a, schema, table, group_by, plans)?),
+            Box::new(compile_having(b, schema, table, group_by, plans)?),
+        ),
+    })
+}
+
+/// Evaluate a compiled `HAVING` for one group with SQL three-valued
+/// logic. `None` means unknown (a NULL operand).
+fn eval_having(expr: &CompiledHaving, computed: &[Value], keyvals: &[Value]) -> Option<bool> {
+    match expr {
+        CompiledHaving::Compare { left, op, value } => {
+            let lhs = match left {
+                HavingRef::GroupKey(pos) => &keyvals[*pos],
+                HavingRef::Plan(idx) => &computed[*idx],
+            };
+            if matches!(lhs, Value::Null) || matches!(value, Value::Null) {
+                return None;
+            }
+            let ord = compare_values(lhs, value);
+            Some(match op {
+                CmpOp::Eq => ord.is_eq(),
+                CmpOp::Ne => ord.is_ne(),
+                CmpOp::Lt => ord.is_lt(),
+                CmpOp::Gt => ord.is_gt(),
+                CmpOp::Le => ord.is_le(),
+                CmpOp::Ge => ord.is_ge(),
+            })
+        }
+        CompiledHaving::Not(inner) => eval_having(inner, computed, keyvals).map(|b| !b),
+        CompiledHaving::And(a, b) => {
+            match (
+                eval_having(a, computed, keyvals),
+                eval_having(b, computed, keyvals),
+            ) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), Some(true)) => Some(true),
+                _ => None,
+            }
+        }
+        CompiledHaving::Or(a, b) => {
+            match (
+                eval_having(a, computed, keyvals),
+                eval_having(b, computed, keyvals),
+            ) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// Map a literal directly to a value (no column-type coercion — used by
+/// `HAVING`, which compares against computed aggregate values).
+fn literal_to_value(literal: Literal) -> Value {
+    match literal {
+        Literal::Null => Value::Null,
+        Literal::Int(n) => Value::Int(n),
+        Literal::Real(x) => Value::Real(x),
+        Literal::Text(s) => Value::Text(s),
+        Literal::Vector(v) => Value::Vector(v),
+    }
 }
 
 /// Fold `value` into a running MIN (`want_min`) or MAX. NULLs are
@@ -2837,6 +2998,70 @@ mod tests {
         assert_eq!(
             rows_of(db.execute("SELECT price FROM m WHERE id = 3").unwrap()),
             vec![vec![real(3.0)]]
+        );
+    }
+
+    #[test]
+    fn having_filters_groups() {
+        let dir = ciphra_testutil::tempdir();
+        let mut db = engine(dir.path());
+        db.execute("CREATE TABLE emp (id INT PRIMARY KEY, dept TEXT, salary INT)")
+            .unwrap();
+        db.execute(
+            "INSERT INTO emp VALUES (1,'eng',100),(2,'eng',200),(3,'sales',50),(4,'hr',999)",
+        )
+        .unwrap();
+
+        // HAVING on a selected aggregate.
+        assert_eq!(
+            rows_of(
+                db.execute("SELECT dept, COUNT(*) FROM emp GROUP BY dept HAVING COUNT(*) > 1")
+                    .unwrap()
+            ),
+            vec![vec![text("eng"), int(2)]]
+        );
+
+        // HAVING on an aggregate that is NOT in the projection.
+        assert_eq!(
+            rows_of(
+                db.execute("SELECT dept FROM emp GROUP BY dept HAVING SUM(salary) >= 300")
+                    .unwrap()
+            ),
+            vec![vec![text("eng")], vec![text("hr")]]
+        );
+
+        // Compound HAVING mixing an aggregate and a grouping column.
+        assert_eq!(
+            rows_of(
+                db.execute(
+                    "SELECT dept, SUM(salary) FROM emp GROUP BY dept \
+                     HAVING SUM(salary) >= 100 AND dept != 'hr'"
+                )
+                .unwrap()
+            ),
+            vec![vec![text("eng"), int(300)]]
+        );
+
+        // Whole-table HAVING (no GROUP BY) keeps or drops the single row.
+        assert!(
+            rows_of(
+                db.execute("SELECT COUNT(*) FROM emp HAVING COUNT(*) > 100")
+                    .unwrap()
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            rows_of(
+                db.execute("SELECT COUNT(*) FROM emp HAVING COUNT(*) >= 4")
+                    .unwrap()
+            ),
+            vec![vec![int(4)]]
+        );
+
+        // HAVING on a non-grouped, non-aggregate column is an error.
+        assert!(
+            db.execute("SELECT dept FROM emp GROUP BY dept HAVING salary > 1")
+                .is_err()
         );
     }
 

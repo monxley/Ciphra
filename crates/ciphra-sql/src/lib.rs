@@ -58,6 +58,8 @@ pub enum Statement {
         predicate: Option<Expr>,
         /// Grouping columns for an aggregate query; empty otherwise.
         group_by: Vec<String>,
+        /// Post-aggregation filter over groups (`HAVING`).
+        having: Option<HavingExpr>,
         order_by: Option<OrderBy>,
         limit: Option<Limit>,
     },
@@ -150,6 +152,29 @@ pub enum AggFunc {
 pub enum AggArg {
     Star,
     Column(String),
+}
+
+/// A `HAVING` predicate: like [`Expr`] but its comparison operands are
+/// aggregates or grouping columns rather than plain row columns.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HavingExpr {
+    Compare {
+        term: HavingTerm,
+        op: CmpOp,
+        value: Literal,
+    },
+    Not(Box<HavingExpr>),
+    And(Box<HavingExpr>, Box<HavingExpr>),
+    Or(Box<HavingExpr>, Box<HavingExpr>),
+}
+
+/// The left-hand operand of a `HAVING` comparison.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HavingTerm {
+    /// A grouping column (must appear in `GROUP BY`).
+    Column(String),
+    /// An aggregate over the group.
+    Aggregate { func: AggFunc, arg: AggArg },
 }
 
 impl AggFunc {
@@ -406,6 +431,8 @@ mod tests {
                 table: "users".into(),
                 predicate: Some(cmp("id", CmpOp::Ge, Literal::Int(-2))),
                 group_by: vec![],
+
+                having: None,
                 order_by: None,
                 limit: None,
             }
@@ -492,6 +519,8 @@ mod tests {
                 table: "t".into(),
                 predicate: None,
                 group_by: vec![],
+
+                having: None,
                 order_by: Some(OrderBy {
                     column: "id".into(),
                     descending: true,
@@ -635,6 +664,45 @@ mod tests {
         assert!(parse_statements("SELECT SUM(*) FROM t").is_err());
         assert!(parse_statements("SELECT * FROM t GROUP BY a").is_err());
         assert!(parse_statements("SELECT COUNT( FROM t").is_err());
+    }
+
+    #[test]
+    fn parses_having() {
+        let stmt = one(
+            "SELECT dept, COUNT(*) FROM emp GROUP BY dept HAVING COUNT(*) > 1 AND dept = 'eng'",
+        );
+        let Statement::Select { having, .. } = stmt else {
+            unreachable!()
+        };
+        assert_eq!(
+            having,
+            Some(HavingExpr::And(
+                Box::new(HavingExpr::Compare {
+                    term: HavingTerm::Aggregate {
+                        func: AggFunc::Count,
+                        arg: AggArg::Star
+                    },
+                    op: CmpOp::Gt,
+                    value: Literal::Int(1),
+                }),
+                Box::new(HavingExpr::Compare {
+                    term: HavingTerm::Column("dept".into()),
+                    op: CmpOp::Eq,
+                    value: Literal::Text("eng".into()),
+                }),
+            ))
+        );
+
+        // HAVING keeps the aggregate projection even without GROUP BY.
+        let stmt = one("SELECT COUNT(*) FROM t HAVING COUNT(*) > 0");
+        let Statement::Select {
+            columns, having, ..
+        } = stmt
+        else {
+            unreachable!()
+        };
+        assert!(having.is_some());
+        assert!(matches!(columns, Projection::Items(_)));
     }
 
     #[test]
