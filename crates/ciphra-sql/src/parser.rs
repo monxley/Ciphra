@@ -2,8 +2,8 @@
 
 use crate::lexer::{Token, tokenize};
 use crate::{
-    Assignment, CmpOp, ColumnDef, DataType, Expr, Limit, Literal, OrderBy, ParseError, Projection,
-    Statement,
+    AggArg, AggFunc, Assignment, CmpOp, ColumnDef, DataType, Expr, Limit, Literal, OrderBy,
+    ParseError, Projection, SelectItem, Statement,
 };
 
 /// Parse zero or more `;`-separated statements.
@@ -181,18 +181,51 @@ impl Parser {
     }
 
     fn select(&mut self) -> Result<Statement, ParseError> {
-        let columns = if self.eat(&Token::Star) {
-            Projection::All
+        let (mut columns, has_aggregate) = if self.eat(&Token::Star) {
+            (Projection::All, false)
         } else {
-            let mut cols = vec![self.identifier("column name")?];
+            let mut items = vec![self.select_item()?];
             while self.eat(&Token::Comma) {
-                cols.push(self.identifier("column name")?);
+                items.push(self.select_item()?);
             }
-            Projection::Columns(cols)
+            let has_aggregate = items
+                .iter()
+                .any(|it| matches!(it, SelectItem::Aggregate { .. }));
+            (Projection::Items(items), has_aggregate)
         };
         self.expect_keyword("from")?;
         let table = self.identifier("table name")?;
         let predicate = self.optional_where()?;
+
+        let mut group_by = Vec::new();
+        if self.eat_keyword("group") {
+            self.expect_keyword("by")?;
+            group_by.push(self.identifier("column name")?);
+            while self.eat(&Token::Comma) {
+                group_by.push(self.identifier("column name")?);
+            }
+        }
+
+        // Collapse a plain column projection with no grouping back to the
+        // simple form the non-aggregate executor path expects.
+        if !has_aggregate
+            && group_by.is_empty()
+            && let Projection::Items(items) = &columns
+        {
+            let plain: Vec<String> = items
+                .iter()
+                .map(|it| match it {
+                    SelectItem::Column(name) => name.clone(),
+                    SelectItem::Aggregate { .. } => unreachable!(),
+                })
+                .collect();
+            columns = Projection::Columns(plain);
+        }
+        if matches!(columns, Projection::All) && !group_by.is_empty() {
+            return Err(ParseError(
+                "SELECT * cannot be combined with GROUP BY; list the grouping columns".into(),
+            ));
+        }
 
         let order_by = if self.eat_keyword("order") {
             self.expect_keyword("by")?;
@@ -245,9 +278,52 @@ impl Parser {
             columns,
             table,
             predicate,
+            group_by,
             order_by,
             limit,
         })
+    }
+
+    /// One projected item: `func(*|col)` for an aggregate, else a column.
+    fn select_item(&mut self) -> Result<SelectItem, ParseError> {
+        if let Some(func) = self.peek_aggregate() {
+            self.pos += 1; // function name
+            self.expect(&Token::LParen)?;
+            let arg = if self.eat(&Token::Star) {
+                if func != AggFunc::Count {
+                    return Err(ParseError(format!(
+                        "{}(*) is not allowed; {} needs a column",
+                        func.name(),
+                        func.name()
+                    )));
+                }
+                AggArg::Star
+            } else {
+                AggArg::Column(self.identifier("a column inside the aggregate")?)
+            };
+            self.expect(&Token::RParen)?;
+            Ok(SelectItem::Aggregate { func, arg })
+        } else {
+            Ok(SelectItem::Column(self.identifier("column name")?))
+        }
+    }
+
+    /// If the next tokens are `agg (`, return the aggregate function.
+    fn peek_aggregate(&self) -> Option<AggFunc> {
+        let Some(Token::Ident(name)) = self.peek() else {
+            return None;
+        };
+        let func = match name.as_str() {
+            "count" => AggFunc::Count,
+            "sum" => AggFunc::Sum,
+            "min" => AggFunc::Min,
+            "max" => AggFunc::Max,
+            _ => return None,
+        };
+        match self.tokens.get(self.pos + 1) {
+            Some(Token::LParen) => Some(func),
+            _ => None,
+        }
     }
 
     fn update(&mut self) -> Result<Statement, ParseError> {

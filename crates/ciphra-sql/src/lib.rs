@@ -56,6 +56,8 @@ pub enum Statement {
         columns: Projection,
         table: String,
         predicate: Option<Expr>,
+        /// Grouping columns for an aggregate query; empty otherwise.
+        group_by: Vec<String>,
         order_by: Option<OrderBy>,
         limit: Option<Limit>,
     },
@@ -114,6 +116,47 @@ pub enum Literal {
 pub enum Projection {
     All,
     Columns(Vec<String>),
+    /// A mix of grouping columns and aggregate functions — the shape of
+    /// an aggregate query (`SELECT dept, COUNT(*) ... GROUP BY dept`).
+    Items(Vec<SelectItem>),
+}
+
+/// One item in an aggregate query's projection.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SelectItem {
+    /// A bare column — must appear in `GROUP BY`.
+    Column(String),
+    /// An aggregate function over the group.
+    Aggregate { func: AggFunc, arg: AggArg },
+}
+
+/// Supported aggregate functions. `AVG` is intentionally absent until a
+/// non-integer numeric type exists (its result is generally fractional).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggFunc {
+    Count,
+    Sum,
+    Min,
+    Max,
+}
+
+/// The argument of an aggregate: `*` (only for `COUNT`) or a column.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AggArg {
+    Star,
+    Column(String),
+}
+
+impl AggFunc {
+    /// The canonical name used in output column headers.
+    pub fn name(self) -> &'static str {
+        match self {
+            AggFunc::Count => "COUNT",
+            AggFunc::Sum => "SUM",
+            AggFunc::Min => "MIN",
+            AggFunc::Max => "MAX",
+        }
+    }
 }
 
 /// One `column = literal` pair in an `UPDATE ... SET` list.
@@ -355,6 +398,7 @@ mod tests {
                 columns: Projection::All,
                 table: "users".into(),
                 predicate: Some(cmp("id", CmpOp::Ge, Literal::Int(-2))),
+                group_by: vec![],
                 order_by: None,
                 limit: None,
             }
@@ -440,6 +484,7 @@ mod tests {
                 columns: Projection::Columns(vec!["name".into()]),
                 table: "t".into(),
                 predicate: None,
+                group_by: vec![],
                 order_by: Some(OrderBy {
                     column: "id".into(),
                     descending: true,
@@ -532,6 +577,57 @@ mod tests {
                 nearest_to: None,
             })
         );
+    }
+
+    #[test]
+    fn parses_aggregates_and_group_by() {
+        let stmt = one("SELECT dept, COUNT(*), SUM(salary) FROM emp GROUP BY dept");
+        let Statement::Select {
+            columns, group_by, ..
+        } = stmt
+        else {
+            unreachable!()
+        };
+        assert_eq!(group_by, vec!["dept".to_string()]);
+        assert_eq!(
+            columns,
+            Projection::Items(vec![
+                SelectItem::Column("dept".into()),
+                SelectItem::Aggregate {
+                    func: AggFunc::Count,
+                    arg: AggArg::Star
+                },
+                SelectItem::Aggregate {
+                    func: AggFunc::Sum,
+                    arg: AggArg::Column("salary".into())
+                },
+            ])
+        );
+
+        // A bare aggregate with no GROUP BY is still an Items projection.
+        let stmt = one("SELECT MIN(x), MAX(x) FROM t");
+        let Statement::Select {
+            columns, group_by, ..
+        } = stmt
+        else {
+            unreachable!()
+        };
+        assert!(group_by.is_empty());
+        assert!(matches!(columns, Projection::Items(items) if items.len() == 2));
+
+        // `count` as a plain column name (no parens) stays a column.
+        let stmt = one("SELECT count FROM t");
+        let Statement::Select { columns, .. } = stmt else {
+            unreachable!()
+        };
+        assert_eq!(columns, Projection::Columns(vec!["count".into()]));
+    }
+
+    #[test]
+    fn aggregate_parse_errors() {
+        assert!(parse_statements("SELECT SUM(*) FROM t").is_err());
+        assert!(parse_statements("SELECT * FROM t GROUP BY a").is_err());
+        assert!(parse_statements("SELECT COUNT( FROM t").is_err());
     }
 
     #[test]

@@ -46,7 +46,9 @@ rather than add-ons.
   `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `DROP TABLE`;
   compound `WHERE` (`AND`/`OR`/`NOT`, parentheses, `IS [NOT] NULL`)
   with proper SQL three-valued logic; `ORDER BY` / `LIMIT` / `OFFSET`;
-  typed columns (`INT`, `TEXT`).
+  aggregates (`COUNT`/`SUM`/`MIN`/`MAX`) with `GROUP BY`; typed columns
+  (`INT`, `TEXT`). Aggregates run in the engine over decrypted rows, so
+  they carry the same leakage profile as a plain `SELECT`.
 - **`PRIMARY KEY`** with uniqueness and non-NULL enforcement, backed by
   an encrypted equality index: `WHERE pk = x` is a point lookup, not a
   scan — and the index stores only keyed tags of values, never values.
@@ -159,6 +161,8 @@ are meta commands:
 ciphra> CREATE TABLE users (id INT PRIMARY KEY, name TEXT, ssn TEXT ENCRYPTED);
 ciphra> INSERT INTO users VALUES (1, 'alice', '111-22-3333');
 ciphra> SELECT name, ssn FROM users WHERE id = 1;
+ciphra> SELECT count(*), max(id) FROM users;          -- aggregates
+ciphra> SELECT name, count(*) FROM users GROUP BY name;
 ciphra> .tables                 -- list tables
 ciphra> .schema users           -- show a table's columns
 ciphra> .audit verify           -- re-check the whole tamper-evident chain
