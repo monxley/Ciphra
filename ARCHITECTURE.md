@@ -15,6 +15,7 @@ live in [docs/adr/](docs/adr/).
 | `ciphra-net` | Remote-storage protocol: blind server + client (ADR-0003) | storage |
 | `ciphra-server` | Server binary — stores sealed bytes, holds no keys | net, storage |
 | `ciphra` | CLI / REPL binary | engine |
+| `ciphra-ffi` | C ABI over the engine (`cdylib`/`staticlib`); the core language drivers link against | engine |
 | `ciphra-testutil` | Test-only temp-dir helper | — |
 
 `ciphra-server` deliberately cannot depend on `ciphra-crypto`: the
@@ -97,9 +98,28 @@ point outside the attacker's reach. Key rotation carries the chain
 across (roots are over plaintext entries, so re-sealing preserves them)
 and records itself as a ROTATE entry.
 
-v1 is a linear hash chain — the degenerate Merkle case; a tree for
-O(log n) inclusion proofs is the planned upgrade and changes no on-disk
-entry, only adds structure above it.
+The on-disk log is a linear hash chain, and a Merkle tree is computed
+over the same entry leaves (domain-separated: `0x00 ∥ entry` for leaves,
+`0x01 ∥ left ∥ right` for nodes, so a leaf can never be reinterpreted as
+a node). This adds structure above the chain without changing any
+on-disk entry: `.audit prove <n>` produces an O(log n) inclusion proof —
+the sibling hashes from entry *n*'s leaf up to the Merkle root — and
+`verify_inclusion` checks it with only the entry and the root, no
+database or passphrase. A lone node at an odd level is promoted
+unchanged.
+
+**Signed roots (post-quantum).** `.audit sign` signs the current
+`(seq, root)` with ML-DSA-65 (FIPS 204). The signing key is derived
+deterministically from the passphrase (`derive_seed` → ML-DSA keygen),
+so it is reproducible and never stored; the public key is published
+once. This upgrades rollback detection from "compare against a value you
+recorded" to "verify a signature anyone can check" — the verifier needs
+only the public key, not the passphrase or the database, and a quantum
+adversary still cannot forge a signature over a rolled-back root. The
+message is domain-separated (`"ciphra/audit-root/v1" ∥ seq ∥ root ∥
+merkle_root`), so one signature authenticates both the linear head
+(whole-history rollback) and the Merkle root (individual inclusion
+proofs).
 
 ### Sealing
 
@@ -164,13 +184,16 @@ The static transport key authenticates the server but **cannot decrypt
 stored data** — it is unrelated to the passphrase-derived data keys, so
 the server stays blind (ADR-0003).
 
-Honesty note on ML-KEM: it is implemented from FIPS 203's clean
-formulation and verified here for internal consistency — the NTT is
-checked against a schoolbook negacyclic convolution (pinning every zeta
-and gamma) and the full KEM round-trips with implicit rejection. This
-build has no network to pull the official ACVP known-answer vectors, so
-byte-exact cross-implementation interop is on the audit checklist, not
-yet claimed.
+Honesty note on ML-KEM and ML-DSA: both are implemented from the clean
+FIPS 203 / FIPS 204 formulations and verified here for internal
+consistency — each NTT is checked against a schoolbook negacyclic
+convolution (pinning every zeta), the KEM round-trips with implicit
+rejection, and ML-DSA-65 keygen→sign→verify round-trips while a tampered
+message, signature or key is rejected (deterministic signing, so results
+are reproducible). This build has no network to pull the official ACVP
+known-answer vectors, so byte-exact cross-implementation interop is on
+the audit checklist, not yet claimed — but a wrong parameter, zeta,
+sampling or packing step fails the tests here.
 
 ### Replication (log shipping)
 

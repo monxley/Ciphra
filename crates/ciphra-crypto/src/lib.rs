@@ -34,6 +34,7 @@ mod chacha20;
 mod hmac;
 mod hybrid;
 mod keccak;
+mod ml_dsa;
 mod ml_kem;
 mod poly1305;
 mod rand;
@@ -46,6 +47,11 @@ pub use hmac::{hkdf_expand, hkdf_extract, hmac_sha256, pbkdf2_sha256};
 pub use hybrid::{
     CLIENT_HELLO_LEN, ClientHello, ClientState, SERVER_HELLO_LEN, ServerHello, ServerIdentity,
     channel_open, channel_seal, client_finish, client_start, server_respond,
+};
+pub use ml_dsa::{
+    PUBLIC_KEY_LEN as MLDSA_PUBLIC_KEY_LEN, SECRET_KEY_LEN as MLDSA_SECRET_KEY_LEN,
+    SEED_LEN as MLDSA_SEED_LEN, SIGNATURE_LEN as MLDSA_SIGNATURE_LEN,
+    keypair_from_seed as mldsa_keypair_from_seed, sign as mldsa_sign, verify as mldsa_verify,
 };
 pub use rand::fill_random;
 pub use sha256::{Sha256, sha256};
@@ -129,6 +135,18 @@ impl MasterKey {
         let mut key = [0u8; KEY_LEN];
         hkdf_expand(&prk, context.as_bytes(), &mut key);
         CipherKey(key)
+    }
+
+    /// Derive a 32-byte seed for a purpose, e.g. a signing key. Like
+    /// [`derive_key`](Self::derive_key) but returns raw bytes rather than
+    /// a cipher key — used to seed deterministic key generation (ML-DSA
+    /// audit-root signing) so the key is reproducible from the passphrase
+    /// and never stored.
+    pub fn derive_seed(&self, context: &str) -> [u8; 32] {
+        let prk = hkdf_extract(b"ciphra/v0/seed", &self.0);
+        let mut seed = [0u8; 32];
+        hkdf_expand(&prk, context.as_bytes(), &mut seed);
+        seed
     }
 
     /// Deterministic keyed tag: an opaque, stable identifier for `data`

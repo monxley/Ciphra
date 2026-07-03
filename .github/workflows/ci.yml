@@ -29,3 +29,25 @@ jobs:
         run: cargo test --workspace
       - name: Release build
         run: cargo build --release
+
+  drivers:
+    name: language drivers
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build libciphra
+        run: cargo build --release -p ciphra-ffi
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Go driver
+        run: cd drivers/go && CGO_ENABLED=1 go test ./...
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Python driver
+        env:
+          CIPHRA_LIB: ${{ github.workspace }}/target/release/libciphra.so
+        run: python3 drivers/python/test_ciphra.py

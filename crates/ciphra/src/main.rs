@@ -173,7 +173,9 @@ ENVIRONMENT:
 REPL COMMANDS:
     .tables              List tables
     .schema <table>      Show a table's schema
-    .audit [root|verify] Show or verify the tamper-evident audit chain
+    .audit [root|verify|sign|pubkey|prove <n>]
+                         Show/verify the chain, ML-DSA-sign its root, or
+                         build a Merkle inclusion proof for entry <n>
     .help                Show SQL help
     .exit                Quit"
     );
@@ -293,7 +295,46 @@ All rows are ChaCha20-Poly1305 encrypted before they reach disk."
                 }
                 Err(e) => eprintln!("{e}"),
             },
-            Some(other) => eprintln!("unknown subcommand: .audit {other} (root|verify)"),
+            Some("pubkey") => {
+                println!("audit signing public key (ML-DSA-65, publish once):");
+                println!("{}", hex(&engine.audit_signing_public_key()));
+            }
+            Some("sign") => match engine.sign_audit_root() {
+                Ok(signed) => {
+                    println!("audit root signature (ML-DSA-65, post-quantum):");
+                    println!("  seq:       {}", signed.seq);
+                    println!("  root:      {}", hex(&signed.root));
+                    println!("  merkleroot:{}", hex(&signed.merkle_root));
+                    println!("  publickey: {}", hex(&signed.public_key));
+                    println!("  signature: {}", hex(&signed.signature));
+                    println!(
+                        "(anyone with the public key can verify these offline — no passphrase needed)"
+                    );
+                }
+                Err(e) => eprintln!("{e}"),
+            },
+            Some("prove") => match parts.next().and_then(|n| n.parse::<u64>().ok()) {
+                Some(index) => match engine.audit_inclusion_proof(index) {
+                    Ok((entry, proof, root)) => {
+                        println!("inclusion proof for audit entry {index}:");
+                        println!("  kind:      {}", entry.kind);
+                        println!("  total:     {}", proof.total);
+                        println!("  merkleroot:{}", hex(&root));
+                        println!("  path ({} siblings):", proof.siblings.len());
+                        for sib in &proof.siblings {
+                            println!("    {}", hex(sib));
+                        }
+                        println!(
+                            "(verifies against the signed merkle root — proves this statement is in history)"
+                        );
+                    }
+                    Err(e) => eprintln!("{e}"),
+                },
+                None => eprintln!("usage: .audit prove <entry-index>"),
+            },
+            Some(other) => {
+                eprintln!("unknown subcommand: .audit {other} (root|verify|sign|pubkey|prove)")
+            }
         },
         ".tables" => match engine.tables() {
             Ok(tables) if tables.is_empty() => println!("(no tables)"),

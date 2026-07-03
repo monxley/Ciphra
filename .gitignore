@@ -3,3 +3,7 @@
 ciphra-data/
 *.wal
 .DS_Store
+
+# Python driver bytecode
+__pycache__/
+*.pyc

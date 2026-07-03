@@ -47,7 +47,8 @@ later.
 - [x] Tamper-evident audit chain: sealed hash-chain entry per
       statement, committed atomically with its data; `.audit
       root`/`.audit verify`; rollback detection via external roots.
-      (Merkle tree for O(log n) inclusion proofs: planned upgrade)
+      Merkle tree over the entries gives O(log n) inclusion proofs
+      (`.audit prove <n>`), verifiable against the signed Merkle root.
 - [x] `VECTOR(dim)` type + `ORDER BY col NEAREST TO [..]` similarity
       search: exact brute-force cosine over sealed rows (sealed-blob
       ANN index for large corpora: planned)
@@ -60,7 +61,9 @@ later.
 - [x] Wire protocol v1: blind-server storage protocol (ADR-0003),
       `ciphra-server` binary + `--remote` client; plaintext and keys
       never cross the wire
-- [ ] Python/JS/Go drivers (engine as a library over this protocol)
+- [x] Python/JS/Go drivers: a C ABI (`ciphra-ffi`) runs the engine
+      in-process; thin stdlib-only bindings (`ctypes`, `cgo`, `bun:ffi`),
+      local and remote, keys never leaving the client (drivers/)
 - [x] Transport security: hybrid X25519 + ML-KEM-768 handshake
       (SHA-3/SHAKE, X25519 RFC 7748, ML-KEM-768 FIPS 203 — all from
       scratch), forward-secret + server-authenticated encrypted
@@ -70,7 +73,11 @@ later.
       sealed snapshot, then ordered sealed batches — and applies them
       into its own blind store; replicas can be chained
 - [x] Post-quantum key exchange (ML-KEM) — done in the transport above
-- [ ] ML-DSA-signed audit roots (post-quantum signatures)
+- [x] ML-DSA-signed audit roots: ML-DSA-65 (FIPS 204) implemented from
+      scratch; `.audit sign` signs the current root with a key
+      deterministically derived from the passphrase, so a published root
+      is verifiable offline by anyone (no passphrase) and unforgeable by
+      a quantum adversary
 - [ ] Optional build against audited crypto implementations
 - [ ] External security audit — a release blocker for 1.0
 

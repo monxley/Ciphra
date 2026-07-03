@@ -33,6 +33,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ciphra-ffi"
+version = "0.0.1"
+dependencies = [
+ "ciphra-engine",
+]
+
+[[package]]
 name = "ciphra-net"
 version = "0.0.1"
 dependencies = [

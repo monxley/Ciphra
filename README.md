@@ -74,17 +74,23 @@ rather than add-ons.
   the sealed catalog record.
 - **Zero third-party dependencies.** The entire engine — including
   SHA-256, HMAC, HKDF, PBKDF2, ChaCha20, Poly1305, BLAKE2b, Argon2id,
-  SHA-3/SHAKE, X25519 and ML-KEM-768 — is implemented in this
+  SHA-3/SHAKE, X25519, ML-KEM-768 and ML-DSA-65 — is implemented in this
   repository and verified against official RFC/NIST/FIPS test vectors.
   The supply chain is: the Rust standard library, and this repo.
 - **Vector search over encrypted embeddings**: `VECTOR(dim)` columns
   and `ORDER BY emb NEAREST TO [0.1, ...] LIMIT k` — exact cosine
   similarity computed over sealed rows, so Ciphra doubles as an
   encrypted vector store for RAG workloads.
-- **Tamper-evident audit chain**: every mutating statement appends a
-  sealed hash-chain entry in the same atomic commit as its data.
-  `.audit verify` re-checks all of history; publish `.audit root`
-  externally and any rollback of the database file becomes detectable.
+- **Tamper-evident audit chain, post-quantum signed, with inclusion
+  proofs**: every mutating statement appends a sealed hash-chain entry
+  in the same atomic commit as its data. `.audit verify` re-checks all
+  of history; `.audit sign` signs the current root with **ML-DSA-65**
+  (FIPS 204, from scratch) under a key derived from the passphrase —
+  publish the signature and anyone can verify offline, with no
+  passphrase and no way for a quantum adversary to forge a rolled-back
+  root. `.audit prove <n>` emits an **O(log n) Merkle inclusion proof**:
+  a compact, publicly verifiable receipt that one specific statement is
+  recorded in history, checkable against the signed Merkle root.
 - **Key rotation**: `ciphra --rotate-passphrase` re-encrypts the whole
   database under a new passphrase (new salt, new KDF, new table and
   index tags) with an atomic file swap — a crash cannot strand the
@@ -102,6 +108,12 @@ rather than add-ons.
   in order, and applies them into its own store. Since the whole stream
   is sealed bytes, the replica is as blind as the leader: it mirrors the
   ciphertext without ever seeing a key. Replicas can be chained.
+- **Language drivers for Python, Go and JavaScript**: a small C ABI
+  (`ciphra-ffi`) exposes the engine so each driver runs the *real* Rust
+  engine in-process — encryption and keys stay on the client, and for a
+  remote database only sealed bytes reach the blind server. Each binding
+  is standard-library only (`ctypes`, `cgo`, `bun:ffi`), no packages to
+  install. See [drivers/](drivers/).
 - **Sealed backup/restore**: `--backup file` exports one
   self-contained encrypted snapshot (audit chain included);
   `--restore file` verifies the passphrase and the chain before use.
@@ -151,6 +163,9 @@ ciphra> .tables                 -- list tables
 ciphra> .schema users           -- show a table's columns
 ciphra> .audit verify           -- re-check the whole tamper-evident chain
 ciphra> .audit root             -- print the current audit root to publish
+ciphra> .audit sign             -- ML-DSA-65 signature over the root (post-quantum)
+ciphra> .audit pubkey           -- the audit signing public key (publish once)
+ciphra> .audit prove 2          -- Merkle inclusion proof that entry 2 is in history
 ciphra> .help                   -- SQL cheatsheet
 ciphra> .exit
 ```
@@ -226,6 +241,27 @@ read-only for clients and as blind as the leader.
 ./target/release/ciphra --remote 127.0.0.1:5078 --server-key <replica-key>
 ```
 
+### Language drivers (Python / Go / JavaScript)
+
+Embed Ciphra in your app through a thin, dependency-free binding over
+`libciphra`. The engine runs in-process, so keys and plaintext stay on
+the client; for a remote database only sealed bytes reach the server.
+
+```sh
+cargo build --release -p ciphra-ffi   # builds libciphra the drivers link against
+```
+
+```python
+from ciphra import Ciphra                       # drivers/python (ctypes)
+with Ciphra.open("./mydb", "pick a long passphrase") as db:
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, note TEXT ENCRYPTED)")
+    db.execute("INSERT INTO t VALUES (1, 'hello')")
+    print(db.query("SELECT id, note FROM t"))    # [{'id': 1, 'note': 'hello'}]
+```
+
+Go (`cgo`) and JavaScript (Bun, `bun:ffi`) drivers expose the same API —
+see [drivers/README.md](drivers/README.md).
+
 ## Architecture
 
 ```
@@ -276,6 +312,15 @@ Ciphra has **not** been audited. The v0 crypto implementations follow the
 primary specifications and pass official test vectors, but until an
 external audit lands, treat this as a development-grade system. Found
 something? Please open a security advisory rather than a public issue.
+
+## Support the project
+
+Ciphra is built in the open with no third-party dependencies. If it is
+useful to you, donations help fund the work toward an external security
+audit:
+
+- **BTC** — `bc1qlakzxqgaahuqf7newzfc4dfnhk4knnm4pht6q3`
+- **ETH** — `0x6be4c971f7c7e765ab92a9f1eed4098ffdf77805`
 
 ## License
 

@@ -130,6 +130,102 @@ const AUDIT_PREFIX: &[u8] = b"a\x00";
 const AUDIT_HEAD_KEY: &[u8] = b"\x00audit";
 /// Fixed size of a serialized audit entry (see [`AuditEntry`]).
 const AUDIT_ENTRY_LEN: usize = 8 + 8 + 1 + 16 + 32 + 32;
+/// HKDF context for the deterministic ML-DSA audit-signing seed.
+const AUDIT_SIGNING_CONTEXT: &str = "audit-signing";
+/// Domain-separation prefix for the signed audit-root message.
+const AUDIT_ROOT_MESSAGE_TAG: &[u8] = b"ciphra/audit-root/v1";
+
+/// An ML-DSA signature over an audit root, plus everything needed to
+/// verify it. Self-contained and safe to publish.
+///
+/// Commits to both the linear chain head (`root`) and the Merkle root
+/// (`merkle_root`) over the same entries, so a single published,
+/// post-quantum signature authenticates both whole-history rollback
+/// detection and individual [inclusion proofs](Engine::audit_inclusion_proof).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedAuditRoot {
+    /// Number of entries the roots commit to.
+    pub seq: u64,
+    /// The audit root (linear chain head hash).
+    pub root: [u8; 32],
+    /// The Merkle root over all entries (for inclusion proofs).
+    pub merkle_root: [u8; 32],
+    /// ML-DSA public key (derived from the passphrase; publish once).
+    pub public_key: Vec<u8>,
+    /// ML-DSA signature over `(tag ∥ seq ∥ root ∥ merkle_root)`.
+    pub signature: Vec<u8>,
+}
+
+/// The canonical message signed for an audit root: a domain-separation
+/// tag, the sequence number, the linear chain head and the Merkle root.
+fn audit_root_message(seq: u64, root: &[u8; 32], merkle_root: &[u8; 32]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(AUDIT_ROOT_MESSAGE_TAG.len() + 8 + 32 + 32);
+    msg.extend_from_slice(AUDIT_ROOT_MESSAGE_TAG);
+    msg.extend_from_slice(&seq.to_le_bytes());
+    msg.extend_from_slice(root);
+    msg.extend_from_slice(merkle_root);
+    msg
+}
+
+/// A Merkle inclusion proof: the sibling hashes on the path from one
+/// entry's leaf up to the Merkle root. Verifiable against a (signed)
+/// root with only the entry — O(log n) in the number of entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MerkleProof {
+    /// Position of the proved entry (equals its `seq`).
+    pub index: u64,
+    /// Total number of entries the tree was built over.
+    pub total: u64,
+    /// Sibling hashes from the leaf level upward.
+    pub siblings: Vec<[u8; 32]>,
+}
+
+/// Leaf hash of an audit entry, domain-separated from internal nodes so
+/// a leaf can never be reinterpreted as a node (second-preimage safety).
+fn merkle_leaf(entry_bytes: &[u8]) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(1 + entry_bytes.len());
+    buf.push(0x00);
+    buf.extend_from_slice(entry_bytes);
+    ciphra_crypto::sha256(&buf)
+}
+
+/// Internal Merkle node hash over its two children.
+fn merkle_node(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut buf = [0u8; 1 + 64];
+    buf[0] = 0x01;
+    buf[1..33].copy_from_slice(left);
+    buf[33..].copy_from_slice(right);
+    ciphra_crypto::sha256(&buf)
+}
+
+/// The Merkle root over `leaves`. A lone (odd) node is promoted to the
+/// next level unchanged. Empty input yields a fixed empty-tree root.
+fn merkle_levels(leaves: &[[u8; 32]]) -> Vec<Vec<[u8; 32]>> {
+    let mut levels = vec![leaves.to_vec()];
+    while levels.last().unwrap().len() > 1 {
+        let cur = levels.last().unwrap();
+        let mut next = Vec::with_capacity(cur.len().div_ceil(2));
+        let mut i = 0;
+        while i < cur.len() {
+            if i + 1 < cur.len() {
+                next.push(merkle_node(&cur[i], &cur[i + 1]));
+                i += 2;
+            } else {
+                next.push(cur[i]); // promote the lone node
+                i += 1;
+            }
+        }
+        levels.push(next);
+    }
+    levels
+}
+
+fn merkle_root_of(leaves: &[[u8; 32]]) -> [u8; 32] {
+    match leaves.len() {
+        0 => ciphra_crypto::sha256(b"ciphra/merkle/empty/v1"),
+        _ => *merkle_levels(leaves).last().unwrap().first().unwrap(),
+    }
+}
 
 /// Statement kinds recorded in the audit chain.
 pub mod audit_kind {
@@ -584,6 +680,134 @@ impl Engine {
             ));
         }
         Ok(entries)
+    }
+
+    /// The ML-DSA public key for this database's audit-root signatures.
+    ///
+    /// Deterministically derived from the passphrase (never stored), so
+    /// publishing it once lets anyone verify every future signed root
+    /// offline — with post-quantum security (FIPS 204).
+    pub fn audit_signing_public_key(&self) -> Vec<u8> {
+        let seed = self.master.derive_seed(AUDIT_SIGNING_CONTEXT);
+        ciphra_crypto::mldsa_keypair_from_seed(&seed).0
+    }
+
+    /// The Merkle root over all audit entries — the commitment that
+    /// [inclusion proofs](Self::audit_inclusion_proof) verify against.
+    /// Recomputes and validates the chain, so it fails if history was
+    /// tampered with.
+    pub fn audit_merkle_root(&self) -> Result<[u8; 32]> {
+        let leaves = self.audit_leaves()?;
+        Ok(merkle_root_of(&leaves))
+    }
+
+    /// Leaf hashes of every audit entry, in order.
+    fn audit_leaves(&self) -> Result<Vec<[u8; 32]>> {
+        Ok(self
+            .audit_verify()?
+            .iter()
+            .map(|e| merkle_leaf(&e.encode()))
+            .collect())
+    }
+
+    /// Sign the current audit root with ML-DSA. The result is
+    /// self-contained: `(seq, root, merkle_root)`, the public key and the
+    /// signature. Publish it, and any later rollback of the database
+    /// becomes detectable by anyone — no passphrase needed to verify, and
+    /// no quantum computer can forge it. The signed Merkle root also lets
+    /// anyone check individual inclusion proofs.
+    pub fn sign_audit_root(&self) -> Result<SignedAuditRoot> {
+        let (seq, root) = self.audit_head;
+        let merkle_root = self.audit_merkle_root()?;
+        let seed = self.master.derive_seed(AUDIT_SIGNING_CONTEXT);
+        let (public_key, secret_key) = ciphra_crypto::mldsa_keypair_from_seed(&seed);
+        let signature =
+            ciphra_crypto::mldsa_sign(&secret_key, &audit_root_message(seq, &root, &merkle_root));
+        Ok(SignedAuditRoot {
+            seq,
+            root,
+            merkle_root,
+            public_key,
+            signature,
+        })
+    }
+
+    /// Verify a [`SignedAuditRoot`] against a published public key. This
+    /// is a pure function — it needs neither the database nor the
+    /// passphrase, so an external auditor can run it with only the public
+    /// key, the claimed roots and the signature.
+    pub fn verify_audit_root(signed: &SignedAuditRoot, public_key: &[u8]) -> bool {
+        ciphra_crypto::mldsa_verify(
+            public_key,
+            &audit_root_message(signed.seq, &signed.root, &signed.merkle_root),
+            &signed.signature,
+        )
+    }
+
+    /// Build a Merkle inclusion proof for the audit entry at `index`.
+    /// Returns the entry, its proof, and the Merkle root the proof leads
+    /// to. Together with a [`SignedAuditRoot`] whose `merkle_root`
+    /// matches, this is a compact, publicly verifiable receipt that the
+    /// statement is recorded in history.
+    pub fn audit_inclusion_proof(&self, index: u64) -> Result<(AuditEntry, MerkleProof, [u8; 32])> {
+        let entries = self.audit_verify()?;
+        let idx = index as usize;
+        if idx >= entries.len() {
+            return Err(EngineError::Audit(format!(
+                "no audit entry at index {index} (chain has {} entries)",
+                entries.len()
+            )));
+        }
+        let leaves: Vec<[u8; 32]> = entries.iter().map(|e| merkle_leaf(&e.encode())).collect();
+        let levels = merkle_levels(&leaves);
+        let root = *levels.last().unwrap().first().unwrap();
+
+        let mut siblings = Vec::new();
+        let mut pos = idx;
+        for level in &levels[..levels.len() - 1] {
+            if pos % 2 == 1 {
+                siblings.push(level[pos - 1]);
+            } else if pos + 1 < level.len() {
+                siblings.push(level[pos + 1]);
+            }
+            pos /= 2;
+        }
+        let proof = MerkleProof {
+            index,
+            total: entries.len() as u64,
+            siblings,
+        };
+        Ok((entries[idx].clone(), proof, root))
+    }
+
+    /// Verify a Merkle inclusion proof for `entry` against `root`. Pure:
+    /// an external auditor runs it with only the entry, the proof and a
+    /// (signed) Merkle root — no database, no passphrase.
+    pub fn verify_inclusion(entry: &AuditEntry, proof: &MerkleProof, root: &[u8; 32]) -> bool {
+        if proof.index != entry.seq || proof.index >= proof.total {
+            return false;
+        }
+        let mut hash = merkle_leaf(&entry.encode());
+        let mut pos = proof.index;
+        let mut size = proof.total;
+        let mut siblings = proof.siblings.iter();
+        while size > 1 {
+            if pos % 2 == 1 {
+                let Some(sib) = siblings.next() else {
+                    return false;
+                };
+                hash = merkle_node(sib, &hash);
+            } else if pos + 1 < size {
+                let Some(sib) = siblings.next() else {
+                    return false;
+                };
+                hash = merkle_node(&hash, sib);
+            }
+            // else: promoted lone node — carried up unchanged.
+            pos /= 2;
+            size = size.div_ceil(2);
+        }
+        siblings.next().is_none() && &hash == root
     }
 
     /// Re-encrypt the whole database under a new passphrase (and KDF).
@@ -3013,6 +3237,90 @@ mod tests {
         let db = engine(dir.path());
         assert_eq!(db.audit_root(), (seq, root));
         db.audit_verify().unwrap();
+    }
+
+    #[test]
+    fn audit_root_signature_verifies_and_rejects_forgery() {
+        let dir = ciphra_testutil::tempdir();
+        let mut db = engine(dir.path());
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+        let signed = db.sign_audit_root().unwrap();
+        let pubkey = db.audit_signing_public_key();
+        assert_eq!(signed.public_key, pubkey);
+        assert_eq!((signed.seq, signed.root), db.audit_root());
+        assert_eq!(signed.merkle_root, db.audit_merkle_root().unwrap());
+
+        // Anyone with the published key verifies without the passphrase.
+        assert!(Engine::verify_audit_root(&signed, &pubkey));
+
+        // A rolled-back root (wrong seq) under the same signature fails.
+        let mut rolled_back = signed.clone();
+        rolled_back.seq = 0;
+        assert!(!Engine::verify_audit_root(&rolled_back, &pubkey));
+
+        // A tampered root fails.
+        let mut tampered = signed.clone();
+        tampered.root[0] ^= 0x01;
+        assert!(!Engine::verify_audit_root(&tampered, &pubkey));
+
+        // A tampered Merkle root fails too.
+        let mut tampered_merkle = signed.clone();
+        tampered_merkle.merkle_root[0] ^= 0x01;
+        assert!(!Engine::verify_audit_root(&tampered_merkle, &pubkey));
+
+        // The signing key is deterministic across reopen: same public key,
+        // and a fresh signature still verifies against the old one's key.
+        drop(db);
+        let db = engine(dir.path());
+        assert_eq!(db.audit_signing_public_key(), pubkey);
+        assert!(Engine::verify_audit_root(
+            &db.sign_audit_root().unwrap(),
+            &pubkey
+        ));
+    }
+
+    #[test]
+    fn audit_inclusion_proofs_verify_for_every_entry() {
+        let dir = ciphra_testutil::tempdir();
+        let mut db = engine(dir.path());
+        // A chain whose length (5) is not a power of two exercises the
+        // promoted-lone-node path in the Merkle tree.
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+            .unwrap();
+        for i in 0..4 {
+            db.execute(&format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+                .unwrap();
+        }
+        let (seq, _) = db.audit_root();
+        assert_eq!(seq, 5);
+
+        let signed = db.sign_audit_root().unwrap();
+        for index in 0..seq {
+            let (entry, proof, root) = db.audit_inclusion_proof(index).unwrap();
+            assert_eq!(root, signed.merkle_root);
+            assert_eq!(entry.seq, index);
+            // Verifies against the signed root, with only the entry + proof.
+            assert!(Engine::verify_inclusion(
+                &entry,
+                &proof,
+                &signed.merkle_root
+            ));
+
+            // A wrong entry at the same position is rejected.
+            let mut forged = entry.clone();
+            forged.writes_digest[0] ^= 0x01;
+            assert!(!Engine::verify_inclusion(
+                &forged,
+                &proof,
+                &signed.merkle_root
+            ));
+        }
+
+        // An out-of-range index errors rather than panicking.
+        assert!(db.audit_inclusion_proof(seq).is_err());
     }
 
     #[test]
