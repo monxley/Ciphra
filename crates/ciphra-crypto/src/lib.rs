@@ -4,7 +4,9 @@
 //! specifications and verified against official test vectors:
 //! SHA-256 (FIPS 180-4), HMAC (RFC 2104), HKDF (RFC 5869),
 //! PBKDF2 (RFC 8018), ChaCha20-Poly1305 (RFC 8439),
-//! BLAKE2b (RFC 7693), Argon2id (RFC 9106).
+//! BLAKE2b (RFC 7693), Argon2id (RFC 9106), SHA-3/SHAKE (FIPS 202),
+//! X25519 (RFC 7748). ML-KEM-768 (FIPS 203) is verified for internal
+//! consistency (NTT vs schoolbook, KEM round-trip) — see ARCHITECTURE.
 //!
 //! Key hierarchy:
 //!
@@ -30,13 +32,21 @@ mod argon2;
 mod blake2b;
 mod chacha20;
 mod hmac;
+mod hybrid;
+mod keccak;
+mod ml_kem;
 mod poly1305;
 mod rand;
 mod sha256;
+mod x25519;
 
 pub use argon2::argon2id;
 pub use blake2b::{Blake2b, blake2b};
 pub use hmac::{hkdf_expand, hkdf_extract, hmac_sha256, pbkdf2_sha256};
+pub use hybrid::{
+    CLIENT_HELLO_LEN, ClientHello, ClientState, SERVER_HELLO_LEN, ServerHello, ServerIdentity,
+    channel_open, channel_seal, client_finish, client_start, server_respond,
+};
 pub use rand::fill_random;
 pub use sha256::{Sha256, sha256};
 

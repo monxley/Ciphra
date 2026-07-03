@@ -27,6 +27,7 @@ fn run() -> Result<ExitCode, String> {
     let mut backup: Option<String> = None;
     let mut restore: Option<String> = None;
     let mut remote: Option<String> = None;
+    let mut server_key: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -46,6 +47,9 @@ fn run() -> Result<ExitCode, String> {
             }
             "--remote" => {
                 remote = Some(args.next().ok_or("--remote requires host:port")?);
+            }
+            "--server-key" => {
+                server_key = Some(args.next().ok_or("--server-key requires a hex key")?);
             }
             "--help" | "-h" => {
                 print_usage();
@@ -89,8 +93,22 @@ run them on the host that owns it"
         return Ok(ExitCode::SUCCESS);
     }
 
+    let pinned = match &server_key {
+        Some(hex_key) => Some(parse_key(hex_key)?),
+        None => None,
+    };
     let mut engine = match &remote {
-        Some(addr) => Engine::open_remote(addr, &passphrase).map_err(|e| e.to_string())?,
+        Some(addr) => {
+            let engine =
+                Engine::open_remote(addr, &passphrase, pinned).map_err(|e| e.to_string())?;
+            if pinned.is_none() {
+                eprintln!(
+                    "warning: connected without --server-key; the channel is encrypted and \
+                     post-quantum but the server is UNAUTHENTICATED (MITM-exposed)"
+                );
+            }
+            engine
+        }
         None => Engine::open(&data_dir, &passphrase).map_err(|e| e.to_string())?,
     };
 
@@ -142,6 +160,7 @@ OPTIONS:
     -e, --execute <SQL>  Execute statements and exit (repeatable)
     --rotate-passphrase  Re-encrypt the database under {NEW_PASSPHRASE_ENV}
     --remote <ADDR>      Connect to a ciphra-server instead of a local file
+    --server-key <HEX>   Pin the server's transport key (authenticates it)
     --backup <FILE>      Write a sealed snapshot of the database
     --restore <FILE>     Restore a snapshot into --data (must be empty)
     -h, --help           Show this help
@@ -158,6 +177,19 @@ REPL COMMANDS:
     .help                Show SQL help
     .exit                Quit"
     );
+}
+
+fn parse_key(hex_key: &str) -> Result<[u8; 32], String> {
+    let hex_key = hex_key.trim();
+    if hex_key.len() != 64 {
+        return Err("--server-key must be 64 hex characters (32 bytes)".into());
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex_key[2 * i..2 * i + 2], 16)
+            .map_err(|_| "--server-key is not valid hex".to_string())?;
+    }
+    Ok(out)
 }
 
 fn hex(bytes: &[u8]) -> String {

@@ -421,17 +421,24 @@ impl Engine {
 
     /// Connect to a `ciphra-server` and open the database it stores.
     ///
-    /// The server holds sealed bytes only (ADR-0003): the passphrase,
-    /// every derived key and all plaintext stay on this side of the
-    /// connection. Statements execute here; the wire carries ciphertext.
-    pub fn open_remote(addr: &str, passphrase: &str) -> Result<Self> {
-        Self::open_remote_with_kdf(addr, passphrase, KdfParams::recommended())
+    /// The connection runs a hybrid X25519+ML-KEM handshake and is
+    /// encrypted thereafter; `pinned` is the server's static transport
+    /// key (authenticate against it; `None` trusts on first use). The
+    /// server holds sealed bytes only (ADR-0003): the passphrase, every
+    /// derived key and all plaintext stay on this side of the wire.
+    pub fn open_remote(addr: &str, passphrase: &str, pinned: Option<[u8; 32]>) -> Result<Self> {
+        Self::open_remote_with_kdf(addr, passphrase, pinned, KdfParams::recommended())
     }
 
     /// [`Engine::open_remote`] with explicit KDF parameters for a
     /// database being created on the server.
-    pub fn open_remote_with_kdf(addr: &str, passphrase: &str, kdf: KdfParams) -> Result<Self> {
-        let remote = RemoteStorage::connect(addr).map_err(StorageError::Io)?;
+    pub fn open_remote_with_kdf(
+        addr: &str,
+        passphrase: &str,
+        pinned: Option<[u8; 32]>,
+        kdf: KdfParams,
+    ) -> Result<Self> {
+        let remote = RemoteStorage::connect(addr, pinned).map_err(StorageError::Io)?;
         Self::open_store(Store::Remote(remote), None, passphrase, kdf)
     }
 
@@ -2583,13 +2590,20 @@ mod tests {
         ));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
+        let identity = ciphra_crypto::ServerIdentity::generate();
+        let server_public = identity.public;
+        let secret = identity.secret_bytes();
         std::thread::spawn(move || {
-            let _ = ciphra_net::serve(listener, storage);
+            let _ = ciphra_net::serve(listener, storage, secret);
         });
 
-        let mut db =
-            Engine::open_remote_with_kdf(&addr, "remote-pass", KdfParams::Pbkdf2 { iterations: 2 })
-                .unwrap();
+        let mut db = Engine::open_remote_with_kdf(
+            &addr,
+            "remote-pass",
+            Some(server_public),
+            KdfParams::Pbkdf2 { iterations: 2 },
+        )
+        .unwrap();
         db.execute(
             "CREATE TABLE t (id INT PRIMARY KEY, v TEXT ENCRYPTED); \
              CREATE INDEX ON t (v); \
@@ -2602,13 +2616,22 @@ mod tests {
 
         // A second client sees committed state; a wrong passphrase is
         // rejected by the canary exactly as it is locally.
-        let mut second =
-            Engine::open_remote_with_kdf(&addr, "remote-pass", KdfParams::Pbkdf2 { iterations: 2 })
-                .unwrap();
+        let mut second = Engine::open_remote_with_kdf(
+            &addr,
+            "remote-pass",
+            Some(server_public),
+            KdfParams::Pbkdf2 { iterations: 2 },
+        )
+        .unwrap();
         assert_eq!(rows_of(second.execute("SELECT * FROM t").unwrap()).len(), 2);
-        let err = Engine::open_remote_with_kdf(&addr, "wrong", KdfParams::Pbkdf2 { iterations: 2 })
-            .err()
-            .expect("wrong passphrase must fail over the wire too");
+        let err = Engine::open_remote_with_kdf(
+            &addr,
+            "wrong",
+            Some(server_public),
+            KdfParams::Pbkdf2 { iterations: 2 },
+        )
+        .err()
+        .expect("wrong passphrase must fail over the wire too");
         assert!(matches!(err, EngineError::BadPassphrase), "got {err:?}");
 
         // Server-side files contain no plaintext: the server is blind.
@@ -2625,9 +2648,13 @@ mod tests {
         // Backup works over the wire (dump + local snapshot write)...
         let backup_dir = ciphra_testutil::tempdir();
         let snapshot = backup_dir.path().join("remote.backup");
-        let db =
-            Engine::open_remote_with_kdf(&addr, "remote-pass", KdfParams::Pbkdf2 { iterations: 2 })
-                .unwrap();
+        let db = Engine::open_remote_with_kdf(
+            &addr,
+            "remote-pass",
+            Some(server_public),
+            KdfParams::Pbkdf2 { iterations: 2 },
+        )
+        .unwrap();
         db.backup_to(&snapshot).unwrap();
         let restore_dir = ciphra_testutil::tempdir();
         let mut restored =

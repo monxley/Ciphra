@@ -7,17 +7,22 @@
 //! read. Consequently the wire protocol is a storage protocol — GET,
 //! SCAN, COMMIT, DUMP — not a SQL protocol.
 //!
-//! Framing: every message is `len (u32 LE) | payload`. Requests start
-//! with an opcode byte; responses with a status byte (0 = ok, 1 =
-//! error + UTF-8 message). v1 is plain TCP; the transport-security
-//! layer (and its post-quantum key exchange) attaches at exactly this
-//! boundary later.
+//! Framing: every message is `len (u32 LE) | payload`. The connection
+//! opens with a hybrid X25519+ML-KEM handshake (two plaintext hello
+//! frames — key exchange material is public by nature); every frame
+//! after that is sealed with ChaCha20-Poly1305 under a per-direction
+//! key and monotonic counter. Requests start with an opcode byte;
+//! responses with a status byte (0 = ok, 1 = error + UTF-8 message).
 
 use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 
+use ciphra_crypto::{
+    ClientHello, SERVER_HELLO_LEN, ServerHello, ServerIdentity, channel_open, channel_seal,
+    client_finish, client_start, server_respond, sha256,
+};
 use ciphra_storage::{Batch, Storage, StorageError};
 
 const OP_GET: u8 = 1;
@@ -39,24 +44,99 @@ const MAX_FRAME: u32 = 256 * 1024 * 1024;
 // ---------------------------------------------------------------- server
 
 /// Serve `storage` on `listener`, one thread per connection, forever.
-/// This process stores and returns sealed bytes; it has no keys and
-/// nothing in it can decrypt.
-pub fn serve(listener: TcpListener, storage: Arc<Mutex<Storage>>) -> std::io::Result<()> {
+/// `server_secret` is the static X25519 transport identity clients pin.
+/// This process stores and returns sealed bytes; it has no data keys
+/// and nothing in it can decrypt stored rows.
+pub fn serve(
+    listener: TcpListener,
+    storage: Arc<Mutex<Storage>>,
+    server_secret: [u8; 32],
+) -> std::io::Result<()> {
     loop {
         let (stream, _) = listener.accept()?;
         let storage = Arc::clone(&storage);
         std::thread::spawn(move || {
-            let _ = handle_connection(stream, &storage);
+            let _ = handle_connection(stream, &storage, server_secret);
         });
     }
 }
 
-fn handle_connection(mut stream: TcpStream, storage: &Mutex<Storage>) -> std::io::Result<()> {
+/// A per-direction sealed channel: two keys and two counters so a frame
+/// sent one way can never collide (nonce reuse) with one sent the other.
+struct Channel {
+    send_key: [u8; 32],
+    recv_key: [u8; 32],
+    send_ctr: u64,
+    recv_ctr: u64,
+}
+
+impl Channel {
+    /// Derive the directional keys from the handshake secret. `client`
+    /// flips which key is used for sending vs receiving.
+    fn new(shared: [u8; 32], client: bool) -> Self {
+        let c2s = derive(&shared, b"c2s");
+        let s2c = derive(&shared, b"s2c");
+        if client {
+            Channel {
+                send_key: c2s,
+                recv_key: s2c,
+                send_ctr: 0,
+                recv_ctr: 0,
+            }
+        } else {
+            Channel {
+                send_key: s2c,
+                recv_key: c2s,
+                send_ctr: 0,
+                recv_ctr: 0,
+            }
+        }
+    }
+
+    fn send(&mut self, stream: &mut impl Write, plaintext: &[u8]) -> std::io::Result<()> {
+        let sealed = channel_seal(&self.send_key, self.send_ctr, plaintext);
+        self.send_ctr += 1;
+        write_frame(stream, &sealed)
+    }
+
+    fn recv(&mut self, stream: &mut impl Read) -> std::io::Result<Vec<u8>> {
+        let sealed = read_frame(stream)?;
+        let opened = channel_open(&self.recv_key, self.recv_ctr, &sealed)
+            .ok_or_else(|| std::io::Error::other("channel authentication failed"))?;
+        self.recv_ctr += 1;
+        Ok(opened)
+    }
+}
+
+fn derive(shared: &[u8; 32], label: &[u8]) -> [u8; 32] {
+    let mut input = shared.to_vec();
+    input.extend_from_slice(label);
+    sha256(&input)
+}
+
+fn handle_connection(
+    mut stream: TcpStream,
+    storage: &Mutex<Storage>,
+    server_secret: [u8; 32],
+) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
+    let identity = ServerIdentity::from_secret(server_secret);
+
+    // Handshake: read the client hello, answer with (static pub || our
+    // hello), both as plaintext frames.
+    let client_hello_bytes = read_frame(&mut stream)?;
+    let client_hello = ClientHello::from_bytes(&client_hello_bytes)
+        .ok_or_else(|| std::io::Error::other("bad client hello"))?;
+    let (server_hello, shared) = server_respond(&identity, &client_hello);
+    let mut reply = identity.public.to_vec();
+    reply.extend_from_slice(&server_hello.to_bytes());
+    write_frame(&mut stream, &reply)?;
+
+    let mut channel = Channel::new(shared, false);
     loop {
-        let request = match read_frame(&mut stream) {
+        let request = match channel.recv(&mut stream) {
             Ok(frame) => frame,
-            Err(_) => return Ok(()), // peer went away
+            Err(_) => return Ok(()), // peer went away or auth failed
         };
         let response = match handle_request(&request, storage) {
             Ok(mut ok) => {
@@ -70,7 +150,7 @@ fn handle_connection(mut stream: TcpStream, storage: &Mutex<Storage>) -> std::io
                 framed
             }
         };
-        write_frame(&mut stream, &response)?;
+        channel.send(&mut stream, &response)?;
     }
 }
 
@@ -143,14 +223,50 @@ fn handle_request(request: &[u8], storage: &Mutex<Storage>) -> Result<Vec<u8>, S
 /// read-only engine paths issue network requests.
 pub struct RemoteStorage {
     stream: RefCell<TcpStream>,
+    channel: RefCell<Channel>,
+    /// The server's static public key, learned during the handshake.
+    pub server_public: [u8; 32],
+    /// Whether the server's static key was authenticated against a pin.
+    pub authenticated: bool,
 }
 
 impl RemoteStorage {
-    pub fn connect(addr: impl ToSocketAddrs) -> std::io::Result<Self> {
-        let stream = TcpStream::connect(addr)?;
+    /// Connect and run the hybrid handshake. If `pinned` is `Some`, the
+    /// server's static key must match it (authenticated); if `None`, the
+    /// server's key is trusted on first use — encrypted and
+    /// post-quantum, but open to a man-in-the-middle.
+    pub fn connect(addr: impl ToSocketAddrs, pinned: Option<[u8; 32]>) -> std::io::Result<Self> {
+        let mut stream = TcpStream::connect(addr)?;
         stream.set_nodelay(true)?;
+
+        let (state, hello) = client_start();
+        write_frame(&mut stream, &hello.to_bytes())?;
+        let reply = read_frame(&mut stream)?;
+        if reply.len() != 32 + SERVER_HELLO_LEN {
+            return Err(std::io::Error::other("bad server hello"));
+        }
+        let mut server_public = [0u8; 32];
+        server_public.copy_from_slice(&reply[..32]);
+        let authenticated = match pinned {
+            Some(expected) => {
+                if expected != server_public {
+                    return Err(std::io::Error::other(
+                        "server key does not match the pinned --server-key",
+                    ));
+                }
+                true
+            }
+            None => false,
+        };
+        let server_hello = ServerHello::from_bytes(&reply[32..])
+            .ok_or_else(|| std::io::Error::other("bad server hello"))?;
+        let shared = client_finish(&state, &server_hello, &server_public);
+
         Ok(RemoteStorage {
             stream: RefCell::new(stream),
+            channel: RefCell::new(Channel::new(shared, true)),
+            server_public,
+            authenticated,
         })
     }
 
@@ -208,8 +324,11 @@ impl RemoteStorage {
 
     fn roundtrip(&self, request: &[u8]) -> Result<Vec<u8>, StorageError> {
         let mut stream = self.stream.borrow_mut();
-        write_frame(&mut *stream, request).map_err(StorageError::Io)?;
-        let response = read_frame(&mut *stream).map_err(StorageError::Io)?;
+        let mut channel = self.channel.borrow_mut();
+        channel
+            .send(&mut *stream, request)
+            .map_err(StorageError::Io)?;
+        let response = channel.recv(&mut *stream).map_err(StorageError::Io)?;
         let (&status, body) = response
             .split_first()
             .ok_or_else(|| protocol_error("empty response"))?;
@@ -308,21 +427,25 @@ fn protocol_error(message: impl std::fmt::Display) -> StorageError {
 mod tests {
     use super::*;
 
-    fn spawn_server() -> (std::net::SocketAddr, ciphra_testutil::TempDir) {
+    fn spawn_server() -> (std::net::SocketAddr, [u8; 32], ciphra_testutil::TempDir) {
         let dir = ciphra_testutil::tempdir();
         let storage = Arc::new(Mutex::new(Storage::open(dir.path()).unwrap()));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        let identity = ServerIdentity::generate();
+        let public = identity.public;
+        let secret = identity.secret_bytes();
         std::thread::spawn(move || {
-            let _ = serve(listener, storage);
+            let _ = serve(listener, storage, secret);
         });
-        (addr, dir)
+        (addr, public, dir)
     }
 
     #[test]
     fn remote_roundtrip() {
-        let (addr, _dir) = spawn_server();
-        let client = RemoteStorage::connect(addr).unwrap();
+        let (addr, server_public, _dir) = spawn_server();
+        let client = RemoteStorage::connect(addr, Some(server_public)).unwrap();
+        assert!(client.authenticated);
 
         assert_eq!(client.get(b"missing").unwrap(), None);
         client.put(b"a", b"1").unwrap();
@@ -341,7 +464,26 @@ mod tests {
         assert_eq!(client.scan_prefix(b"").unwrap().len(), 1);
 
         // Two clients see the same state.
-        let second = RemoteStorage::connect(addr).unwrap();
+        let second = RemoteStorage::connect(addr, Some(server_public)).unwrap();
         assert_eq!(second.get(b"c").unwrap(), Some(b"3".to_vec()));
+    }
+
+    #[test]
+    fn pinning_a_wrong_key_is_refused() {
+        let (addr, _real, _dir) = spawn_server();
+        let wrong = ServerIdentity::generate().public;
+        let err = RemoteStorage::connect(addr, Some(wrong))
+            .err()
+            .expect("mismatched pin must be refused");
+        assert!(err.to_string().contains("pinned"));
+    }
+
+    #[test]
+    fn trust_on_first_use_is_unauthenticated_but_works() {
+        let (addr, _real, _dir) = spawn_server();
+        let client = RemoteStorage::connect(addr, None).unwrap();
+        assert!(!client.authenticated);
+        client.put(b"k", b"v").unwrap();
+        assert_eq!(client.get(b"k").unwrap(), Some(b"v".to_vec()));
     }
 }
