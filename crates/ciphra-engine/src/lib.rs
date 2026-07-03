@@ -57,7 +57,8 @@ pub use codec::TableSchema;
 use ciphra_crypto::{CipherKey, CryptoError, MasterKey};
 use ciphra_net::RemoteStorage;
 use ciphra_sql::{
-    Assignment, CmpOp, Expr, Limit, Literal, OrderBy, ParseError, Projection, Statement,
+    AggArg, AggFunc, Assignment, CmpOp, Expr, Limit, Literal, OrderBy, ParseError, Projection,
+    SelectItem, Statement,
 };
 use ciphra_storage::{Batch, Storage, StorageError};
 
@@ -988,9 +989,10 @@ impl Engine {
                 columns,
                 table,
                 predicate,
+                group_by,
                 order_by,
                 limit,
-            } => self.select(&table, columns, predicate, order_by, limit),
+            } => self.select(&table, columns, predicate, group_by, order_by, limit),
             Statement::Update {
                 table,
                 assignments,
@@ -1378,11 +1380,33 @@ impl Engine {
         table: &str,
         projection: Projection,
         predicate: Option<Expr>,
+        group_by: Vec<String>,
         order_by: Option<OrderBy>,
         limit: Option<Limit>,
     ) -> Result<QueryResult> {
         let schema = self.expect_schema(table)?;
         let filter = predicate.map(|p| compile_expr(&schema, p)).transpose()?;
+
+        // Aggregate / GROUP BY queries take a separate path: collect the
+        // filtered rows, then fold them into groups.
+        if let Projection::Items(items) = &projection {
+            if order_by.is_some() {
+                return Err(EngineError::Schema(
+                    "ORDER BY is not yet supported with aggregates or GROUP BY".into(),
+                ));
+            }
+            let table_key = self.table_key(table);
+            let mut rows = Vec::new();
+            for (_, row) in self.candidate_rows(table, &schema, filter.as_ref(), &table_key)? {
+                if let Some(filter) = &filter
+                    && !filter.matches(&row)?
+                {
+                    continue;
+                }
+                rows.push(row);
+            }
+            return aggregate(&schema, table, items, &group_by, rows, limit);
+        }
 
         let output: Vec<usize> = match &projection {
             Projection::All => (0..schema.columns.len()).collect(),
@@ -1394,6 +1418,7 @@ impl Engine {
                     })
                 })
                 .collect::<Result<_>>()?,
+            Projection::Items(_) => unreachable!("handled above"),
         };
         let column_names: Vec<String> = output
             .iter()
@@ -1970,6 +1995,238 @@ fn pk_column(schema: &TableSchema) -> Option<usize> {
     schema.columns.iter().position(|c| c.primary_key)
 }
 
+/// A resolved projection item for an aggregate query.
+enum AggPlan {
+    /// A grouping column, taken from position `usize` in the group key.
+    GroupCol(usize),
+    /// `COUNT(*)` (`None`) or `COUNT(col)` (`Some(idx)`, non-NULL count).
+    Count(Option<usize>),
+    Sum(usize),
+    Min(usize),
+    Max(usize),
+}
+
+/// A running aggregate accumulator, one per [`AggPlan`].
+enum AggAcc {
+    GroupCol,
+    Count(i64),
+    Sum { total: i128, any: bool },
+    Extreme(Option<Value>),
+}
+
+/// Execute an aggregate / `GROUP BY` query over the already-filtered
+/// `rows`. Computed entirely in the engine over decrypted rows, so the
+/// leakage profile is exactly that of a plain `SELECT`.
+fn aggregate(
+    schema: &TableSchema,
+    table: &str,
+    items: &[SelectItem],
+    group_by: &[String],
+    rows: Vec<Vec<Value>>,
+    limit: Option<Limit>,
+) -> Result<QueryResult> {
+    let group_idx: Vec<usize> = group_by
+        .iter()
+        .map(|n| {
+            schema.column_index(n).ok_or_else(|| {
+                EngineError::Schema(format!(
+                    "unknown column {n:?} in GROUP BY of table {table:?}"
+                ))
+            })
+        })
+        .collect::<Result<_>>()?;
+
+    // Resolve each projected item to a plan and an output column name.
+    let mut plans = Vec::with_capacity(items.len());
+    let mut names = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            SelectItem::Column(name) => {
+                let pos = group_by.iter().position(|g| g == name).ok_or_else(|| {
+                    EngineError::Schema(format!(
+                        "column {name:?} must appear in GROUP BY or inside an aggregate"
+                    ))
+                })?;
+                plans.push(AggPlan::GroupCol(pos));
+                names.push(name.clone());
+            }
+            SelectItem::Aggregate { func, arg } => {
+                let (plan, arg_name) = match arg {
+                    AggArg::Star => (AggPlan::Count(None), "*".to_string()),
+                    AggArg::Column(col) => {
+                        let idx = schema.column_index(col).ok_or_else(|| {
+                            EngineError::Schema(format!(
+                                "unknown column {col:?} in table {table:?}"
+                            ))
+                        })?;
+                        let ty = schema.columns[idx].ty;
+                        let plan = match func {
+                            AggFunc::Count => AggPlan::Count(Some(idx)),
+                            AggFunc::Sum => {
+                                if !matches!(ty, DataType::Int) {
+                                    return Err(EngineError::Type(format!(
+                                        "SUM({col}) requires an INT column"
+                                    )));
+                                }
+                                AggPlan::Sum(idx)
+                            }
+                            AggFunc::Min | AggFunc::Max => {
+                                if matches!(ty, DataType::Vector(_)) {
+                                    return Err(EngineError::Type(format!(
+                                        "{}({col}) is not defined on a VECTOR column",
+                                        func.name()
+                                    )));
+                                }
+                                if matches!(func, AggFunc::Min) {
+                                    AggPlan::Min(idx)
+                                } else {
+                                    AggPlan::Max(idx)
+                                }
+                            }
+                        };
+                        (plan, col.clone())
+                    }
+                };
+                names.push(format!("{}({})", func.name(), arg_name));
+                plans.push(plan);
+            }
+        }
+    }
+
+    let init = |plans: &[AggPlan]| -> Vec<AggAcc> {
+        plans
+            .iter()
+            .map(|p| match p {
+                AggPlan::GroupCol(_) => AggAcc::GroupCol,
+                AggPlan::Count(_) => AggAcc::Count(0),
+                AggPlan::Sum(_) => AggAcc::Sum {
+                    total: 0,
+                    any: false,
+                },
+                AggPlan::Min(_) | AggPlan::Max(_) => AggAcc::Extreme(None),
+            })
+            .collect()
+    };
+
+    let mut groups: Vec<(Vec<Value>, Vec<AggAcc>)> = Vec::new();
+    let mut index: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+
+    // With no GROUP BY, an aggregate over an empty set still yields one
+    // row (COUNT = 0, others NULL) — seed that single group up front.
+    if group_by.is_empty() {
+        // Seed with the exact key rows will compute for the empty key.
+        index.insert(codec::encode_row(&[]), 0);
+        groups.push((Vec::new(), init(&plans)));
+    }
+
+    for row in &rows {
+        let keyvals: Vec<Value> = group_idx.iter().map(|&i| row[i].clone()).collect();
+        let key = codec::encode_row(&keyvals);
+        let gi = *index.entry(key).or_insert_with(|| {
+            let gi = groups.len();
+            groups.push((keyvals.clone(), init(&plans)));
+            gi
+        });
+        let accs = &mut groups[gi].1;
+        for (plan, acc) in plans.iter().zip(accs.iter_mut()) {
+            match (plan, acc) {
+                (AggPlan::GroupCol(_), AggAcc::GroupCol) => {}
+                (AggPlan::Count(None), AggAcc::Count(c)) => *c += 1,
+                (AggPlan::Count(Some(idx)), AggAcc::Count(c)) => {
+                    if !matches!(row[*idx], Value::Null) {
+                        *c += 1;
+                    }
+                }
+                (AggPlan::Sum(idx), AggAcc::Sum { total, any }) => match &row[*idx] {
+                    Value::Null => {}
+                    Value::Int(n) => {
+                        *total += *n as i128;
+                        *any = true;
+                    }
+                    other => {
+                        return Err(EngineError::Type(format!(
+                            "SUM encountered a non-integer value: {other}"
+                        )));
+                    }
+                },
+                (AggPlan::Min(idx), AggAcc::Extreme(cur)) => update_extreme(cur, &row[*idx], true),
+                (AggPlan::Max(idx), AggAcc::Extreme(cur)) => update_extreme(cur, &row[*idx], false),
+                _ => unreachable!("plan and accumulator are built in lockstep"),
+            }
+        }
+    }
+
+    // Deterministic output order: sort groups by their key values.
+    groups.sort_by(|a, b| {
+        for (x, y) in a.0.iter().zip(b.0.iter()) {
+            let ord = compare_values(x, y);
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+
+    let mut out_rows = Vec::with_capacity(groups.len());
+    for (keyvals, accs) in &groups {
+        let mut row = Vec::with_capacity(plans.len());
+        for (plan, acc) in plans.iter().zip(accs.iter()) {
+            let value = match (plan, acc) {
+                (AggPlan::GroupCol(pos), _) => keyvals[*pos].clone(),
+                (_, AggAcc::Count(c)) => Value::Int(*c),
+                (_, AggAcc::Sum { total, any }) => {
+                    if *any {
+                        Value::Int(i64::try_from(*total).map_err(|_| {
+                            EngineError::Type("SUM overflowed a 64-bit integer".into())
+                        })?)
+                    } else {
+                        Value::Null
+                    }
+                }
+                (_, AggAcc::Extreme(v)) => v.clone().unwrap_or(Value::Null),
+                _ => unreachable!("plan and accumulator are built in lockstep"),
+            };
+            row.push(value);
+        }
+        out_rows.push(row);
+    }
+
+    let out_rows = match limit {
+        Some(Limit { count, offset }) => out_rows
+            .into_iter()
+            .skip(offset as usize)
+            .take(count as usize)
+            .collect(),
+        None => out_rows,
+    };
+    Ok(QueryResult::Rows {
+        columns: names,
+        rows: out_rows,
+    })
+}
+
+/// Fold `value` into a running MIN (`want_min`) or MAX. NULLs are
+/// ignored, matching SQL aggregate semantics.
+fn update_extreme(current: &mut Option<Value>, value: &Value, want_min: bool) {
+    if matches!(value, Value::Null) {
+        return;
+    }
+    match current {
+        None => *current = Some(value.clone()),
+        Some(existing) => {
+            let ord = compare_values(value, existing);
+            let replace = if want_min {
+                ord == std::cmp::Ordering::Less
+            } else {
+                ord == std::cmp::Ordering::Greater
+            };
+            if replace {
+                *current = Some(value.clone());
+            }
+        }
+    }
+}
+
 /// The row id encoded in the trailing 8 bytes of a row key.
 fn rowid_from_key(key: &[u8]) -> u64 {
     u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap())
@@ -2354,6 +2611,88 @@ mod tests {
 
     fn text(s: &str) -> Value {
         Value::Text(s.into())
+    }
+
+    fn int(n: i64) -> Value {
+        Value::Int(n)
+    }
+
+    #[test]
+    fn aggregates_with_group_by() {
+        let dir = ciphra_testutil::tempdir();
+        let mut db = engine(dir.path());
+        db.execute("CREATE TABLE emp (id INT PRIMARY KEY, dept TEXT, salary INT)")
+            .unwrap();
+        db.execute(
+            "INSERT INTO emp VALUES (1,'eng',100),(2,'eng',200),(3,'sales',50),\
+             (4,'sales',NULL),(5,'eng',NULL)",
+        )
+        .unwrap();
+
+        // Grouped: count(*), count(col) skips NULL, sum/min/max over non-null.
+        let rows = rows_of(
+            db.execute(
+                "SELECT dept, COUNT(*), COUNT(salary), SUM(salary), MIN(salary), MAX(salary) \
+                 FROM emp GROUP BY dept",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![text("eng"), int(3), int(2), int(300), int(100), int(200)],
+                vec![text("sales"), int(2), int(1), int(50), int(50), int(50)],
+            ]
+        );
+
+        // Whole-table aggregate (no GROUP BY): one row.
+        let rows = rows_of(db.execute("SELECT COUNT(*), SUM(salary) FROM emp").unwrap());
+        assert_eq!(rows, vec![vec![int(5), int(350)]]);
+
+        // A WHERE filter applies before aggregation.
+        let rows = rows_of(
+            db.execute("SELECT COUNT(*) FROM emp WHERE dept = 'eng'")
+                .unwrap(),
+        );
+        assert_eq!(rows, vec![vec![int(3)]]);
+    }
+
+    #[test]
+    fn aggregate_edge_cases_and_errors() {
+        let dir = ciphra_testutil::tempdir();
+        let mut db = engine(dir.path());
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, label TEXT, n INT)")
+            .unwrap();
+
+        // Empty table: COUNT is 0, SUM/MIN/MAX are NULL, in one row.
+        let rows = rows_of(
+            db.execute("SELECT COUNT(*), SUM(n), MIN(n), MAX(n) FROM t")
+                .unwrap(),
+        );
+        assert_eq!(
+            rows,
+            vec![vec![int(0), Value::Null, Value::Null, Value::Null]]
+        );
+
+        db.execute("INSERT INTO t VALUES (1,'a',NULL),(2,'a',NULL)")
+            .unwrap();
+        // A group where every value is NULL: SUM/MIN/MAX are NULL, COUNT(n)=0.
+        let rows = rows_of(
+            db.execute("SELECT label, COUNT(n), SUM(n) FROM t GROUP BY label")
+                .unwrap(),
+        );
+        assert_eq!(rows, vec![vec![text("a"), int(0), Value::Null]]);
+
+        // MIN/MAX over TEXT is allowed (lexicographic order).
+        db.execute("INSERT INTO t VALUES (3,'c',1),(4,'b',2)")
+            .unwrap();
+        let rows = rows_of(db.execute("SELECT MIN(label), MAX(label) FROM t").unwrap());
+        assert_eq!(rows, vec![vec![text("a"), text("c")]]);
+
+        // Errors: SUM on TEXT, a non-grouped column, ORDER BY with aggregate.
+        assert!(db.execute("SELECT SUM(label) FROM t").is_err());
+        assert!(db.execute("SELECT label, COUNT(*) FROM t").is_err());
+        assert!(db.execute("SELECT COUNT(*) FROM t ORDER BY id").is_err());
     }
 
     #[test]

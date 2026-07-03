@@ -19,6 +19,8 @@ later.
 
 - [x] `UPDATE`, `AND`/`OR`/`NOT`/`IS NULL` predicates (SQL three-valued
       logic), `ORDER BY`, `LIMIT`/`OFFSET`
+- [x] Aggregates `COUNT`/`SUM`/`MIN`/`MAX` with `GROUP BY` (computed in
+      the engine over decrypted rows; same leakage as a plain `SELECT`)
 - [x] Encrypted table names via opaque keyed tags (no user plaintext
       on disk at all)
 - [x] Primary keys: uniqueness + non-NULL enforcement, point lookups
