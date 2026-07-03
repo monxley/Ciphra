@@ -2,8 +2,8 @@
 
 use crate::lexer::{Token, tokenize};
 use crate::{
-    AggArg, AggFunc, Assignment, CmpOp, ColumnDef, DataType, Expr, Limit, Literal, OrderBy,
-    ParseError, Projection, SelectItem, Statement,
+    AggArg, AggFunc, Assignment, CmpOp, ColumnDef, DataType, Expr, HavingExpr, HavingTerm, Limit,
+    Literal, OrderBy, ParseError, Projection, SelectItem, Statement,
 };
 
 /// Parse zero or more `;`-separated statements.
@@ -207,10 +207,18 @@ impl Parser {
             }
         }
 
+        let having = if self.eat_keyword("having") {
+            Some(self.having_expr()?)
+        } else {
+            None
+        };
+
         // Collapse a plain column projection with no grouping back to the
-        // simple form the non-aggregate executor path expects.
+        // simple form the non-aggregate executor path expects. HAVING
+        // forces the aggregate path, so keep Items when it is present.
         if !has_aggregate
             && group_by.is_empty()
+            && having.is_none()
             && let Projection::Items(items) = &columns
         {
             let plain: Vec<String> = items
@@ -280,9 +288,82 @@ impl Parser {
             table,
             predicate,
             group_by,
+            having,
             order_by,
             limit,
         })
+    }
+
+    // -- HAVING: same OR < AND < NOT < compare shape as WHERE, but the
+    //    comparison operand is an aggregate or a grouping column.
+
+    fn having_expr(&mut self) -> Result<HavingExpr, ParseError> {
+        let mut left = self.having_and()?;
+        while self.eat_keyword("or") {
+            let right = self.having_and()?;
+            left = HavingExpr::Or(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn having_and(&mut self) -> Result<HavingExpr, ParseError> {
+        let mut left = self.having_not()?;
+        while self.eat_keyword("and") {
+            let right = self.having_not()?;
+            left = HavingExpr::And(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn having_not(&mut self) -> Result<HavingExpr, ParseError> {
+        if self.eat_keyword("not") {
+            Ok(HavingExpr::Not(Box::new(self.having_not()?)))
+        } else {
+            self.having_primary()
+        }
+    }
+
+    fn having_primary(&mut self) -> Result<HavingExpr, ParseError> {
+        if self.eat(&Token::LParen) {
+            let inner = self.having_expr()?;
+            self.expect(&Token::RParen)?;
+            return Ok(inner);
+        }
+        let term = if let Some(func) = self.peek_aggregate() {
+            self.pos += 1;
+            self.expect(&Token::LParen)?;
+            let arg = if self.eat(&Token::Star) {
+                if func != AggFunc::Count {
+                    return Err(ParseError(format!(
+                        "{}(*) is not allowed; {} needs a column",
+                        func.name(),
+                        func.name()
+                    )));
+                }
+                AggArg::Star
+            } else {
+                AggArg::Column(self.identifier("a column inside the aggregate")?)
+            };
+            self.expect(&Token::RParen)?;
+            HavingTerm::Aggregate { func, arg }
+        } else {
+            HavingTerm::Column(self.identifier("a column or aggregate in HAVING")?)
+        };
+        let op = match self.next("a comparison operator")? {
+            Token::Eq => CmpOp::Eq,
+            Token::Ne => CmpOp::Ne,
+            Token::Lt => CmpOp::Lt,
+            Token::Gt => CmpOp::Gt,
+            Token::Le => CmpOp::Le,
+            Token::Ge => CmpOp::Ge,
+            other => {
+                return Err(ParseError(format!(
+                    "expected a comparison operator in HAVING, found {other}"
+                )));
+            }
+        };
+        let value = self.literal()?;
+        Ok(HavingExpr::Compare { term, op, value })
     }
 
     /// One projected item: `func(*|col)` for an aggregate, else a column.

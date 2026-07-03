@@ -46,10 +46,10 @@ rather than add-ons.
   `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `DROP TABLE`;
   compound `WHERE` (`AND`/`OR`/`NOT`, parentheses, `IS [NOT] NULL`)
   with proper SQL three-valued logic; `ORDER BY` / `LIMIT` / `OFFSET`;
-  aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`) with `GROUP BY`; typed
-  columns (`INT`, `REAL`, `TEXT`). Aggregates run in the engine over
-  decrypted rows, so they carry the same leakage profile as a plain
-  `SELECT`.
+  aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`) with `GROUP BY` and
+  `HAVING`; typed columns (`INT`, `REAL`, `TEXT`). Aggregates run in the
+  engine over decrypted rows, so they carry the same leakage profile as
+  a plain `SELECT`.
 - **`PRIMARY KEY`** with uniqueness and non-NULL enforcement, backed by
   an encrypted equality index: `WHERE pk = x` is a point lookup, not a
   scan — and the index stores only keyed tags of values, never values.
