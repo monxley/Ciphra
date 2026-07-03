@@ -2585,9 +2585,7 @@ mod tests {
         // A ciphra-server on a loopback socket: the engine runs here
         // with the keys; the server only ever sees sealed bytes.
         let server_dir = ciphra_testutil::tempdir();
-        let storage = std::sync::Arc::new(std::sync::Mutex::new(
-            Storage::open(server_dir.path()).unwrap(),
-        ));
+        let storage = ciphra_net::SharedStorage::new(Storage::open(server_dir.path()).unwrap());
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let identity = ciphra_crypto::ServerIdentity::generate();

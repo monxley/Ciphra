@@ -6,9 +6,9 @@
 
 use std::net::TcpListener;
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
 
 use ciphra_crypto::ServerIdentity;
+use ciphra_net::{FollowEvent, SharedStorage};
 use ciphra_storage::Storage;
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:5077";
@@ -27,6 +27,8 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let mut data_dir = DEFAULT_DATA_DIR.to_string();
     let mut listen = DEFAULT_LISTEN.to_string();
+    let mut follow: Option<String> = None;
+    let mut server_key: Option<[u8; 32]> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -37,16 +39,29 @@ fn run() -> Result<(), String> {
             "--listen" | "-l" => {
                 listen = args.next().ok_or("--listen requires an address argument")?;
             }
+            "--follow" | "-f" => {
+                follow = Some(args.next().ok_or("--follow requires a leader address")?);
+            }
+            "--server-key" | "-k" => {
+                let hex = args
+                    .next()
+                    .ok_or("--server-key requires a 64-hex-char key")?;
+                server_key = Some(parse_key(&hex)?);
+            }
             "--help" | "-h" => {
                 println!(
                     "ciphra-server — stores sealed bytes it cannot read
 
 USAGE:
     ciphra-server [--data <DIR>] [--listen <ADDR>]
+    ciphra-server --follow <LEADER_ADDR> [--server-key <HEX>] [--data <DIR>] [--listen <ADDR>]
 
 OPTIONS:
-    -d, --data <DIR>     Data directory (default: {DEFAULT_DATA_DIR})
-    -l, --listen <ADDR>  Listen address (default: {DEFAULT_LISTEN})
+    -d, --data <DIR>        Data directory (default: {DEFAULT_DATA_DIR})
+    -l, --listen <ADDR>     Listen address (default: {DEFAULT_LISTEN})
+    -f, --follow <ADDR>     Run as a read-only replica of the leader at ADDR:
+                            mirror its commit stream and serve reads locally.
+    -k, --server-key <HEX>  Pin the leader's transport key (with --follow).
 
 This process holds no keys: clients connect with `ciphra --remote <ADDR>`
 and every byte that crosses the wire or touches this disk is ciphertext."
@@ -64,6 +79,12 @@ and every byte that crosses the wire or touches this disk is ciphertext."
     let (secret, public) = load_or_create_identity(&data_dir)?;
 
     let listener = TcpListener::bind(&listen).map_err(|e| e.to_string())?;
+
+    if let Some(leader) = follow {
+        return run_replica(listener, storage, secret, public, leader, server_key);
+    }
+
+    let shared = SharedStorage::new(storage);
     println!("ciphra-server: serving sealed storage from {data_dir} on {listen}");
     println!("(this process has no data keys and cannot decrypt what it stores)");
     println!("transport handshake: hybrid X25519 + ML-KEM-768");
@@ -71,7 +92,76 @@ and every byte that crosses the wire or touches this disk is ciphertext."
         "server key (pin this on clients with --server-key):\n  {}",
         hex(&public)
     );
-    ciphra_net::serve(listener, Arc::new(Mutex::new(storage)), secret).map_err(|e| e.to_string())
+    ciphra_net::serve(listener, shared, secret).map_err(|e| e.to_string())
+}
+
+/// Read-only replica: serve reads from a local store while a background
+/// thread mirrors the leader's commit stream into it (log shipping).
+fn run_replica(
+    listener: TcpListener,
+    storage: Storage,
+    secret: [u8; 32],
+    public: [u8; 32],
+    leader: String,
+    server_key: Option<[u8; 32]>,
+) -> Result<(), String> {
+    let shared = SharedStorage::read_only(storage);
+    println!("ciphra-server: read-only replica of {leader}");
+    println!("(writes are refused here; state is fed by the leader's commit stream)");
+    if server_key.is_none() {
+        println!("warning: leader key not pinned (--server-key); handshake is trust-on-first-use");
+    }
+    println!(
+        "replica key (pin this on read clients with --server-key):\n  {}",
+        hex(&public)
+    );
+
+    // Mirror the leader forever, reconnecting on error.
+    let follow_handle = shared.clone();
+    std::thread::spawn(move || {
+        loop {
+            let result =
+                ciphra_net::follow(
+                    &leader,
+                    server_key,
+                    follow_handle.clone(),
+                    |event| match event {
+                        FollowEvent::Connected { authenticated, .. } => {
+                            let auth = if authenticated {
+                                "authenticated"
+                            } else {
+                                "unauthenticated"
+                            };
+                            println!("replica: connected to leader ({auth}), subscribing");
+                        }
+                        FollowEvent::Snapshot { seq, rows } => {
+                            println!("replica: applied snapshot at seq {seq} ({rows} rows)");
+                        }
+                        FollowEvent::Applied { seq, changes } => {
+                            println!("replica: applied commit seq {seq} ({changes} changes)");
+                        }
+                    },
+                );
+            if let Err(e) = result {
+                eprintln!("replica: stream ended ({e}); reconnecting in 2s");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    });
+
+    ciphra_net::serve(listener, shared, secret).map_err(|e| e.to_string())
+}
+
+fn parse_key(hex: &str) -> Result<[u8; 32], String> {
+    if hex.len() != 64 {
+        return Err("server key must be 64 hex characters (32 bytes)".into());
+    }
+    let mut key = [0u8; 32];
+    for (i, byte) in key.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| "server key must be valid hex".to_string())?;
+    }
+    Ok(key)
 }
 
 const IDENTITY_FILE: &str = "ciphra.serverkey";

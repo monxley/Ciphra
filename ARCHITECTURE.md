@@ -172,6 +172,30 @@ build has no network to pull the official ACVP known-answer vectors, so
 byte-exact cross-implementation interop is on the audit checklist, not
 yet claimed.
 
+### Replication (log shipping)
+
+A follower opens the same sealed transport and sends one `SUBSCRIBE`
+opcode. The leader, holding its state lock, does two things atomically:
+captures a snapshot of every sealed pair at the current commit sequence,
+and registers the follower's channel. Because both happen under one
+lock, no commit can slip into the gap — the first live batch a follower
+sees is always `snapshot_seq + 1`, with no loss and no duplication.
+
+The follower then applies the snapshot as a state replace (local keys
+absent from it are deleted) and, from there, applies each streamed batch
+in commit order, mirroring the leader's sequence number. Every mutation
+on the leader — `PUT`, `DELETE`, `COMMIT` — is broadcast to subscribers
+as the same sealed batch bytes it just committed; a subscriber whose
+channel has closed is dropped on the next broadcast. A replica re-emits
+what it applies, so replicas can be chained.
+
+Crucially the entire stream is ciphertext: snapshots and batches are the
+same sealed bytes the storage engine holds, framed and then sealed again
+by the transport. A replica is exactly as blind as the leader — it
+mirrors sealed rows it cannot read and rejects client writes, so its
+only writer is the leader's stream. This is log shipping, not consensus:
+there is one writer (the leader) and no automatic failover yet.
+
 ### Why hand-written primitives?
 
 The core is dependency-free by policy (see ADR-0002): for an encrypted

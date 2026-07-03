@@ -96,19 +96,134 @@ rather than add-ons.
   the channel is forward-secret, server-authenticated (pin the printed
   key with `--server-key`), and safe against harvest-now-decrypt-later.
   SQL, keys and plaintext never leave the client (ADR-0003).
+- **Replication (log shipping)**: `ciphra-server --follow <leader>`
+  runs a read-only replica that subscribes to the leader's commit
+  stream — it receives a sealed snapshot, then every subsequent commit
+  in order, and applies them into its own store. Since the whole stream
+  is sealed bytes, the replica is as blind as the leader: it mirrors the
+  ciphertext without ever seeing a key. Replicas can be chained.
 - **Sealed backup/restore**: `--backup file` exports one
   self-contained encrypted snapshot (audit chain included);
   `--restore file` verifies the passphrase and the chain before use.
 - **CLI/REPL** with meta commands (`.tables`, `.schema`, `.audit`,
   `.help`).
 
-## Quick start
+## Usage
+
+### Build
 
 ```sh
 cargo build --release
-export CIPHRA_PASSPHRASE='pick a long passphrase'
-./target/release/ciphra --data ./mydb            # interactive REPL
+# binaries land in ./target/release/: `ciphra` (client/REPL) and
+# `ciphra-server` (the blind storage server)
+```
+
+### The passphrase
+
+Every database is sealed under a passphrase supplied through the
+`CIPHRA_PASSPHRASE` environment variable — it is never a command-line
+argument (that would leak it into shell history and the process table)
+and it never touches disk. Lose it and the data is unrecoverable; that
+is the point.
+
+```sh
+export CIPHRA_PASSPHRASE='correct horse battery staple'
+```
+
+### Local database (single node)
+
+```sh
+# Interactive REPL against ./mydb (created on first use)
+./target/release/ciphra --data ./mydb
+
+# One-shot: run a statement (or several, ';'-separated) and exit
 ./target/release/ciphra --data ./mydb -e 'SELECT * FROM users;'
+```
+
+Inside the REPL, SQL statements run directly; lines starting with `.`
+are meta commands:
+
+```
+ciphra> CREATE TABLE users (id INT PRIMARY KEY, name TEXT, ssn TEXT ENCRYPTED);
+ciphra> INSERT INTO users VALUES (1, 'alice', '111-22-3333');
+ciphra> SELECT name, ssn FROM users WHERE id = 1;
+ciphra> .tables                 -- list tables
+ciphra> .schema users           -- show a table's columns
+ciphra> .audit verify           -- re-check the whole tamper-evident chain
+ciphra> .audit root             -- print the current audit root to publish
+ciphra> .help                   -- SQL cheatsheet
+ciphra> .exit
+```
+
+### Queryable encryption
+
+```sql
+-- Point lookups through an encrypted equality index (keyed tags only):
+CREATE TABLE t (id INT PRIMARY KEY, email TEXT ENCRYPTED);
+CREATE INDEX ON t (email);            -- opt-in equality index
+SELECT * FROM t WHERE email = 'a@b.c';
+
+-- Range queries over a sealed sorted blob (leaks neither order nor
+-- equality to disk — only the blob's size):
+CREATE RANGE INDEX ON t (id);
+SELECT * FROM t WHERE id >= 100 AND id < 200;
+
+-- Vector similarity search over sealed embeddings (encrypted RAG store):
+CREATE TABLE docs (id INT PRIMARY KEY, body TEXT, emb VECTOR(3));
+SELECT id FROM docs ORDER BY emb NEAREST TO [0.1, 0.9, 0.2] LIMIT 5;
+```
+
+### Key rotation, backup and restore
+
+```sh
+# Re-encrypt the whole database under a new passphrase (atomic swap):
+CIPHRA_PASSPHRASE='old' CIPHRA_NEW_PASSPHRASE='new' \
+  ./target/release/ciphra --data ./mydb --rotate-passphrase
+
+# Export one self-contained sealed snapshot (audit chain included):
+./target/release/ciphra --data ./mydb --backup mydb.ciphra
+
+# Restore it (verifies the passphrase and the audit chain first):
+./target/release/ciphra --data ./restored --restore mydb.ciphra
+```
+
+### Client / server (blind server)
+
+The server stores sealed bytes and holds no keys. Run it, then point a
+client at it — the engine, passphrase and all plaintext stay client-side.
+
+```sh
+# 1. Start the server. It prints a transport key on first boot — pin it.
+./target/release/ciphra-server --data ./srv --listen 127.0.0.1:5077
+#   server key (pin this on clients with --server-key):
+#     3af1…e09c
+
+# 2. Connect a client, pinning that key so the handshake is authenticated
+#    (X25519 + ML-KEM-768, forward-secret and post-quantum):
+export CIPHRA_PASSPHRASE='correct horse battery staple'
+./target/release/ciphra --remote 127.0.0.1:5077 --server-key 3af1…e09c
+```
+
+Without `--server-key` the channel is still encrypted and post-quantum
+but trust-on-first-use (open to a man-in-the-middle); the client warns.
+
+### Replication (read replica)
+
+A replica subscribes to a leader's commit stream and mirrors it. It is
+read-only for clients and as blind as the leader.
+
+```sh
+# Leader (as above):
+./target/release/ciphra-server --data ./leader --listen 127.0.0.1:5077
+#   server key: 3af1…e09c
+
+# Replica: follow the leader, pin its key, serve reads on another port:
+./target/release/ciphra-server \
+    --follow 127.0.0.1:5077 --server-key 3af1…e09c \
+    --data ./replica --listen 127.0.0.1:5078
+
+# Clients can read from the replica (writes are refused there):
+./target/release/ciphra --remote 127.0.0.1:5078 --server-key <replica-key>
 ```
 
 ## Architecture

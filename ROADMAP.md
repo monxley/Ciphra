@@ -65,7 +65,10 @@ later.
       (SHA-3/SHAKE, X25519 RFC 7748, ML-KEM-768 FIPS 203 — all from
       scratch), forward-secret + server-authenticated encrypted
       channel; `--server-key` pinning
-- [ ] Replication (log shipping first)
+- [x] Replication (log shipping): `ciphra-server --follow` runs a
+      read-only replica that subscribes to the leader's commit stream —
+      sealed snapshot, then ordered sealed batches — and applies them
+      into its own blind store; replicas can be chained
 - [x] Post-quantum key exchange (ML-KEM) — done in the transport above
 - [ ] ML-DSA-signed audit roots (post-quantum signatures)
 - [ ] Optional build against audited crypto implementations
