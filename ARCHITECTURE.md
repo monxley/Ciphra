@@ -12,10 +12,15 @@ live in [docs/adr/](docs/adr/).
 | `ciphra-crypto` | Primitives (SHA-256, HMAC, HKDF, PBKDF2, ChaCha20-Poly1305), key hierarchy | — |
 | `ciphra-sql` | Lexer, recursive-descent parser, AST | — |
 | `ciphra-engine` | Catalog, row codec, executor; the only place plaintext and ciphertext meet | storage, crypto, sql |
+| `ciphra-net` | Remote-storage protocol: blind server + client (ADR-0003) | storage |
+| `ciphra-server` | Server binary — stores sealed bytes, holds no keys | net, storage |
 | `ciphra` | CLI / REPL binary | engine |
 | `ciphra-testutil` | Test-only temp-dir helper | — |
 
-The three foundation crates are deliberately independent of each other;
+`ciphra-server` deliberately cannot depend on `ciphra-crypto`: the
+server's blindness is enforced by the dependency graph, not by
+promises. The three foundation crates are deliberately independent
+of each other;
 `ciphra-engine` is the composition point. This keeps the trusted
 computing base explicit: anything that can see plaintext lives in
 `ciphra-engine` and `ciphra-crypto`.

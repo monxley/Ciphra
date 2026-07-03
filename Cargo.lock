@@ -26,9 +26,26 @@ name = "ciphra-engine"
 version = "0.0.1"
 dependencies = [
  "ciphra-crypto",
+ "ciphra-net",
  "ciphra-sql",
  "ciphra-storage",
  "ciphra-testutil",
+]
+
+[[package]]
+name = "ciphra-net"
+version = "0.0.1"
+dependencies = [
+ "ciphra-storage",
+ "ciphra-testutil",
+]
+
+[[package]]
+name = "ciphra-server"
+version = "0.0.1"
+dependencies = [
+ "ciphra-net",
+ "ciphra-storage",
 ]
 
 [[package]]

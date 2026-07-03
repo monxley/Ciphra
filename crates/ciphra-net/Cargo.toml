@@ -1,6 +1,6 @@
 [package]
-name = "ciphra-engine"
-description = "Ciphra execution engine: catalog, row codec and query execution over encrypted storage"
+name = "ciphra-net"
+description = "Ciphra remote-storage protocol: a server that stores sealed bytes it cannot read, and the client for it"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,9 +9,6 @@ authors.workspace = true
 
 [dependencies]
 ciphra-storage.workspace = true
-ciphra-crypto.workspace = true
-ciphra-sql.workspace = true
-ciphra-net.workspace = true
 
 [dev-dependencies]
 ciphra-testutil.workspace = true

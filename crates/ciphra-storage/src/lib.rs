@@ -169,6 +169,25 @@ impl Storage {
         self.map.is_empty()
     }
 
+    /// All live pairs, owned — the transportable form of the state.
+    pub fn dump(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Write `pairs` as a fresh, compacted WAL at `path`: a complete,
+    /// self-contained database file.
+    pub fn write_snapshot(path: impl AsRef<Path>, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+        let mut out = File::create(path.as_ref())?;
+        for (key, value) in pairs {
+            out.write_all(&encode_record(OP_PUT, key, value))?;
+        }
+        out.sync_all()?;
+        Ok(())
+    }
+
     /// Write the live state as a fresh, compacted WAL at `path`.
     /// The result is a complete, self-contained database file.
     pub fn snapshot_to(&self, path: impl AsRef<Path>) -> Result<()> {

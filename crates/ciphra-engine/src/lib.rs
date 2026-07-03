@@ -55,10 +55,62 @@ pub use ciphra_sql::{ColumnDef, DataType};
 pub use codec::TableSchema;
 
 use ciphra_crypto::{CipherKey, CryptoError, MasterKey};
+use ciphra_net::RemoteStorage;
 use ciphra_sql::{
     Assignment, CmpOp, Expr, Limit, Literal, OrderBy, ParseError, Projection, Statement,
 };
 use ciphra_storage::{Batch, Storage, StorageError};
+
+/// Where sealed bytes live: a local WAL, or a remote storage server
+/// that — per ADR-0003 — never holds keys and cannot decrypt anything
+/// it stores. All reads return owned bytes so both backends share one
+/// engine code path.
+enum Store {
+    Local(Storage),
+    Remote(RemoteStorage),
+}
+
+impl Store {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        match self {
+            Store::Local(s) => Ok(s.get(key).map(<[u8]>::to_vec)),
+            Store::Remote(r) => Ok(r.get(key)?),
+        }
+    }
+
+    fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        match self {
+            Store::Local(s) => Ok(s
+                .scan_prefix(prefix)
+                .map(|(k, v)| (k.to_vec(), v.to_vec()))
+                .collect()),
+            Store::Remote(r) => Ok(r.scan_prefix(prefix)?),
+        }
+    }
+
+    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        match self {
+            Store::Local(s) => s.put(key, value)?,
+            Store::Remote(r) => r.put(key, value)?,
+        }
+        Ok(())
+    }
+
+    fn commit(&mut self, batch: Batch) -> Result<()> {
+        match self {
+            Store::Local(s) => s.commit(batch)?,
+            Store::Remote(r) => r.commit(&batch)?,
+        }
+        Ok(())
+    }
+
+    fn dump(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        match self {
+            Store::Local(s) => Ok(s.dump()),
+            Store::Remote(r) => Ok(r.dump()?),
+        }
+    }
+}
 
 /// Legacy sidecar file holding KDF parameters; still read (and migrated
 /// into the WAL) for databases created before the in-WAL record.
@@ -309,9 +361,10 @@ pub enum QueryResult {
 
 /// An open Ciphra database.
 pub struct Engine {
-    storage: Storage,
+    store: Store,
     master: MasterKey,
-    dir: PathBuf,
+    /// Data directory for local databases; `None` when remote.
+    dir: Option<PathBuf>,
     /// Cached audit head: (next sequence number, current chain root).
     audit_head: (u64, [u8; 32]),
 }
@@ -353,47 +406,74 @@ impl Engine {
             let _ = std::fs::remove_dir_all(&leftover);
         }
 
-        let mut storage = Storage::open(&dir)?;
+        let mut store = Store::Local(Storage::open(&dir)?);
 
-        // KDF parameters live inside the WAL, so the database is one
-        // file and rotation can swap it atomically. Databases created
-        // before this migrate from the legacy sidecar file on open.
+        // Databases created before the in-WAL keyparams record migrate
+        // from the legacy sidecar file on open (local databases only).
         let params_path = dir.join(KEYPARAMS_FILE);
-        let recorded = storage.get(KEYPARAMS_KEY).map(<[u8]>::to_vec);
-        let (kdf, salt) = if let Some(record) = recorded {
-            read_keyparams(&record)?
-        } else if params_path.exists() {
+        if store.get(KEYPARAMS_KEY)?.is_none() && params_path.exists() {
             let (kdf, salt) = read_keyparams(&std::fs::read(&params_path)?)?;
-            storage.put(KEYPARAMS_KEY, &encode_keyparams(kdf, &salt))?;
-            (kdf, salt)
-        } else {
-            let salt = ciphra_crypto::random_salt().to_vec();
-            storage.put(KEYPARAMS_KEY, &encode_keyparams(kdf, &salt))?;
-            (kdf, salt)
+            store.put(KEYPARAMS_KEY, &encode_keyparams(kdf, &salt))?;
+        }
+
+        Self::open_store(store, Some(dir), passphrase, kdf)
+    }
+
+    /// Connect to a `ciphra-server` and open the database it stores.
+    ///
+    /// The server holds sealed bytes only (ADR-0003): the passphrase,
+    /// every derived key and all plaintext stay on this side of the
+    /// connection. Statements execute here; the wire carries ciphertext.
+    pub fn open_remote(addr: &str, passphrase: &str) -> Result<Self> {
+        Self::open_remote_with_kdf(addr, passphrase, KdfParams::recommended())
+    }
+
+    /// [`Engine::open_remote`] with explicit KDF parameters for a
+    /// database being created on the server.
+    pub fn open_remote_with_kdf(addr: &str, passphrase: &str, kdf: KdfParams) -> Result<Self> {
+        let remote = RemoteStorage::connect(addr).map_err(StorageError::Io)?;
+        Self::open_store(Store::Remote(remote), None, passphrase, kdf)
+    }
+
+    /// Shared tail of every open path: resolve KDF parameters, derive
+    /// the master key, check the canary, load the audit head.
+    fn open_store(
+        mut store: Store,
+        dir: Option<PathBuf>,
+        passphrase: &str,
+        kdf: KdfParams,
+    ) -> Result<Self> {
+        let (kdf, salt) = match store.get(KEYPARAMS_KEY)? {
+            Some(record) => read_keyparams(&record)?,
+            None => {
+                let salt = ciphra_crypto::random_salt().to_vec();
+                store.put(KEYPARAMS_KEY, &encode_keyparams(kdf, &salt))?;
+                (kdf, salt)
+            }
         };
 
         let master = kdf.derive(passphrase, &salt);
 
         let canary_key = master.derive_key("canary");
-        match storage.get(CANARY_KEY) {
+        match store.get(CANARY_KEY)? {
             Some(sealed) => {
                 canary_key
-                    .open(sealed, CANARY_KEY)
+                    .open(&sealed, CANARY_KEY)
                     .map_err(|_| EngineError::BadPassphrase)?;
             }
             None => {
                 let sealed = canary_key.seal(CANARY_PLAINTEXT, CANARY_KEY);
-                storage.put(CANARY_KEY, &sealed)?;
+                store.put(CANARY_KEY, &sealed)?;
             }
         }
 
         // Load the audit head; a fresh database starts at the genesis
         // root (all zeros) with sequence 0.
         let audit_key = master.derive_key("audit");
-        let audit_head = match storage.get(AUDIT_HEAD_KEY) {
+        let audit_head = match store.get(AUDIT_HEAD_KEY)? {
             None => (0, [0u8; 32]),
             Some(sealed) => {
-                let plain = audit_key.open(sealed, AUDIT_HEAD_KEY)?;
+                let plain = audit_key.open(&sealed, AUDIT_HEAD_KEY)?;
                 if plain.len() != 8 + 32 {
                     return Err(EngineError::Corrupt("bad audit head".into()));
                 }
@@ -405,7 +485,7 @@ impl Engine {
         };
 
         Ok(Engine {
-            storage,
+            store,
             master,
             dir,
             audit_head,
@@ -420,7 +500,8 @@ impl Engine {
     /// restore. Record the current [`Engine::audit_root`] alongside the
     /// backup to be able to prove the restored copy is this exact state.
     pub fn backup_to(&self, path: impl AsRef<Path>) -> Result<()> {
-        self.storage.snapshot_to(path.as_ref())?;
+        let pairs = self.store.dump()?;
+        Storage::write_snapshot(path.as_ref(), &pairs)?;
         Ok(())
     }
 
@@ -469,9 +550,9 @@ impl Engine {
         let audit_key = self.master.derive_key("audit");
         let mut entries = Vec::new();
         let mut root = [0u8; 32];
-        for (key, sealed) in self.storage.scan_prefix(AUDIT_PREFIX) {
+        for (key, sealed) in self.store.scan_prefix(AUDIT_PREFIX)? {
             let plain = audit_key
-                .open(sealed, key)
+                .open(&sealed, &key)
                 .map_err(|_| EngineError::Audit("audit entry failed authentication".into()))?;
             let entry = AuditEntry::decode(&plain)?;
             if entry.seq != entries.len() as u64 {
@@ -507,6 +588,15 @@ impl Engine {
     /// database untouched (the scratch directory is cleaned up on the
     /// next open); a crash after it leaves the new database complete.
     pub fn rotate_to(&mut self, new_passphrase: &str, kdf: KdfParams) -> Result<()> {
+        // Rotation rebuilds the WAL file and swaps it atomically — a
+        // filesystem operation, so it runs where the file lives.
+        let Some(dir) = self.dir.clone() else {
+            return Err(EngineError::Schema(
+                "key rotation runs on the host that owns the database file; \
+                 open the data directory locally to rotate"
+                    .into(),
+            ));
+        };
         // Snapshot everything through the current master key.
         let mut snapshot = Vec::new();
         for name in self.tables()? {
@@ -514,17 +604,17 @@ impl Engine {
             let table_key = self.table_key(&name);
             let seq = self.load_seq(&name, &table_key)?;
             let mut rows = Vec::new();
-            for (key, sealed) in self.storage.scan_prefix(&self.row_prefix(&name)) {
+            for (key, sealed) in self.store.scan_prefix(&self.row_prefix(&name))? {
                 rows.push((
-                    rowid_from_key(key),
-                    codec::decode_row(&table_key.open(sealed, key)?)?,
+                    rowid_from_key(&key),
+                    codec::decode_row(&table_key.open(&sealed, &key)?)?,
                 ));
             }
             snapshot.push((schema, seq, rows));
         }
 
         // Rebuild into a scratch database under the new master.
-        let tmp = self.dir.join(ROTATE_TMP_DIR);
+        let tmp = dir.join(ROTATE_TMP_DIR);
         if tmp.exists() {
             std::fs::remove_dir_all(&tmp)?;
         }
@@ -562,7 +652,7 @@ impl Engine {
                 sort_range_entries(&mut entries);
                 fresh.add_range_blob(&mut writes, &schema.name, &table_key, col, &entries);
             }
-            fresh.storage.commit(writes)?;
+            fresh.store.commit(writes)?;
         }
 
         // Carry the audit chain across, re-sealed under the new audit
@@ -571,11 +661,11 @@ impl Engine {
         let old_audit = self.master.derive_key("audit");
         let new_audit = fresh.master.derive_key("audit");
         let mut audit_writes = Batch::new();
-        for (key, sealed) in self.storage.scan_prefix(AUDIT_PREFIX) {
-            let plain = old_audit.open(sealed, key)?;
-            audit_writes.put(key, &new_audit.seal(&plain, key));
+        for (key, sealed) in self.store.scan_prefix(AUDIT_PREFIX)? {
+            let plain = old_audit.open(&sealed, &key)?;
+            audit_writes.put(&key, &new_audit.seal(&plain, &key));
         }
-        fresh.storage.commit(audit_writes)?;
+        fresh.store.commit(audit_writes)?;
         fresh.audit_head = self.audit_head;
         fresh.commit_with_audit(audit_kind::ROTATE, [0u8; 16], [0u8; 32], Batch::new())?;
         drop(fresh);
@@ -583,16 +673,16 @@ impl Engine {
         // The atomic switch, then cleanup of everything now stale.
         std::fs::rename(
             tmp.join(ciphra_storage::WAL_FILE),
-            self.dir.join(ciphra_storage::WAL_FILE),
+            dir.join(ciphra_storage::WAL_FILE),
         )?;
-        if let Ok(dir_handle) = std::fs::File::open(&self.dir) {
+        if let Ok(dir_handle) = std::fs::File::open(&dir) {
             let _ = dir_handle.sync_all();
         }
         let _ = std::fs::remove_dir_all(&tmp);
-        let _ = std::fs::remove_file(self.dir.join(KEYPARAMS_FILE));
+        let _ = std::fs::remove_file(dir.join(KEYPARAMS_FILE));
 
         // Reopen through the recorded (new) parameters.
-        *self = Engine::open(&self.dir, new_passphrase)?;
+        *self = Engine::open(&dir, new_passphrase)?;
         Ok(())
     }
 
@@ -614,8 +704,8 @@ impl Engine {
     pub fn tables(&self) -> Result<Vec<String>> {
         let catalog_key = self.master.derive_key("catalog");
         let mut names = Vec::new();
-        for (key, sealed) in self.storage.scan_prefix(CATALOG_PREFIX) {
-            let plain = catalog_key.open(sealed, key)?;
+        for (key, sealed) in self.store.scan_prefix(CATALOG_PREFIX)? {
+            let plain = catalog_key.open(&sealed, &key)?;
             names.push(codec::decode_schema(&plain)?.name);
         }
         names.sort();
@@ -625,10 +715,10 @@ impl Engine {
     /// Fetch the schema of `table`, if it exists.
     pub fn schema(&self, table: &str) -> Result<Option<TableSchema>> {
         let key = self.catalog_key(table);
-        match self.storage.get(&key) {
+        match self.store.get(&key)? {
             None => Ok(None),
             Some(sealed) => {
-                let plain = self.master.derive_key("catalog").open(sealed, &key)?;
+                let plain = self.master.derive_key("catalog").open(&sealed, &key)?;
                 Ok(Some(codec::decode_schema(&plain)?))
             }
         }
@@ -825,8 +915,8 @@ impl Engine {
         // one committed batch: the index either exists fully or not at all.
         let table_key = self.table_key(table);
         let mut batch = Batch::new();
-        for (key, sealed) in self.storage.scan_prefix(&self.row_prefix(table)) {
-            let row = codec::decode_row(&table_key.open(sealed, key)?)?;
+        for (key, sealed) in self.store.scan_prefix(&self.row_prefix(table))? {
+            let row = codec::decode_row(&table_key.open(&sealed, &key)?)?;
             if row[col] != Value::Null {
                 self.add_index_entry(
                     &mut batch,
@@ -834,7 +924,7 @@ impl Engine {
                     &table_key,
                     col,
                     &row[col],
-                    rowid_from_key(key),
+                    rowid_from_key(&key),
                 );
             }
         }
@@ -861,10 +951,10 @@ impl Engine {
         }
         let mut batch = Batch::new();
         for (key, _) in self
-            .storage
-            .scan_prefix(&self.index_column_prefix(table, col))
+            .store
+            .scan_prefix(&self.index_column_prefix(table, col))?
         {
-            batch.delete(key);
+            batch.delete(&key);
         }
         schema.columns[col].indexed = false;
         self.add_schema(&mut batch, &schema);
@@ -895,10 +985,10 @@ impl Engine {
         // the schema flag in one committed batch.
         let table_key = self.table_key(table);
         let mut entries: Vec<(Value, u64)> = Vec::new();
-        for (key, sealed) in self.storage.scan_prefix(&self.row_prefix(table)) {
-            let row = codec::decode_row(&table_key.open(sealed, key)?)?;
+        for (key, sealed) in self.store.scan_prefix(&self.row_prefix(table))? {
+            let row = codec::decode_row(&table_key.open(&sealed, &key)?)?;
             if row[col] != Value::Null {
-                entries.push((row[col].clone(), rowid_from_key(key)));
+                entries.push((row[col].clone(), rowid_from_key(&key)));
             }
         }
         sort_range_entries(&mut entries);
@@ -944,8 +1034,8 @@ impl Engine {
             self.index_prefix(name),
             self.range_prefix(name),
         ] {
-            for (key, _) in self.storage.scan_prefix(&prefix) {
-                batch.delete(key);
+            for (key, _) in self.store.scan_prefix(&prefix)? {
+                batch.delete(&key);
             }
         }
         batch.delete(&self.seq_key(name));
@@ -1403,9 +1493,9 @@ impl Engine {
     ) -> Result<Vec<u64>> {
         let prefix = self.index_value_prefix(table, col, value);
         let mut rowids = Vec::new();
-        for (key, sealed) in self.storage.scan_prefix(&prefix) {
-            table_key.open(sealed, key)?;
-            rowids.push(rowid_from_key(key));
+        for (key, sealed) in self.store.scan_prefix(&prefix)? {
+            table_key.open(&sealed, &key)?;
+            rowids.push(rowid_from_key(&key));
         }
         Ok(rowids)
     }
@@ -1431,9 +1521,9 @@ impl Engine {
         col: usize,
     ) -> Result<Vec<(Value, u64)>> {
         let key = self.range_index_key(table, col);
-        match self.storage.get(&key) {
+        match self.store.get(&key)? {
             None => Ok(Vec::new()),
-            Some(sealed) => codec::decode_range_blob(&table_key.open(sealed, &key)?),
+            Some(sealed) => codec::decode_range_blob(&table_key.open(&sealed, &key)?),
         }
     }
 
@@ -1497,12 +1587,12 @@ impl Engine {
             let mut rows = Vec::new();
             for rowid in self.index_rowids(table, table_key, col, value)? {
                 let key = self.row_key(table, rowid);
-                match self.storage.get(&key) {
+                match self.store.get(&key)? {
                     // A dangling index entry (crash between the two
                     // writes) reads as absent.
                     None => continue,
                     Some(sealed) => {
-                        let row = codec::decode_row(&table_key.open(sealed, &key)?)?;
+                        let row = codec::decode_row(&table_key.open(&sealed, &key)?)?;
                         rows.push((key, row));
                     }
                 }
@@ -1528,19 +1618,17 @@ impl Engine {
                     continue;
                 }
                 let key = self.row_key(table, rowid);
-                if let Some(sealed) = self.storage.get(&key) {
-                    let row = codec::decode_row(&table_key.open(sealed, &key)?)?;
+                if let Some(sealed) = self.store.get(&key)? {
+                    let row = codec::decode_row(&table_key.open(&sealed, &key)?)?;
                     rows.push((key, row));
                 }
             }
             return Ok(rows);
         }
         let mut rows = Vec::new();
-        for (key, sealed) in self.storage.scan_prefix(&self.row_prefix(table)) {
-            rows.push((
-                key.to_vec(),
-                codec::decode_row(&table_key.open(sealed, key)?)?,
-            ));
+        for (key, sealed) in self.store.scan_prefix(&self.row_prefix(table))? {
+            let row = codec::decode_row(&table_key.open(&sealed, &key)?)?;
+            rows.push((key, row));
         }
         Ok(rows)
     }
@@ -1564,10 +1652,10 @@ impl Engine {
 
     fn load_seq(&self, table: &str, table_key: &CipherKey) -> Result<u64> {
         let key = self.seq_key(table);
-        match self.storage.get(&key) {
+        match self.store.get(&key)? {
             None => Ok(0),
             Some(sealed) => {
-                let plain = table_key.open(sealed, &key)?;
+                let plain = table_key.open(&sealed, &key)?;
                 let bytes: [u8; 8] = plain
                     .as_slice()
                     .try_into()
@@ -1625,7 +1713,7 @@ impl Engine {
         head.extend_from_slice(&root);
         batch.put(AUDIT_HEAD_KEY, &audit_key.seal(&head, AUDIT_HEAD_KEY));
 
-        self.storage.commit(batch)?;
+        self.store.commit(batch)?;
         self.audit_head = (seq + 1, root);
         Ok(())
     }
@@ -2483,6 +2571,79 @@ mod tests {
         assert_eq!(rows_of(db.execute("SELECT * FROM t").unwrap()).len(), 0);
         // EXPLAIN of unsupported statements is a parse error.
         assert!(db.execute("EXPLAIN CREATE TABLE u (a INT)").is_err());
+    }
+
+    #[test]
+    fn remote_engine_end_to_end() {
+        // A ciphra-server on a loopback socket: the engine runs here
+        // with the keys; the server only ever sees sealed bytes.
+        let server_dir = ciphra_testutil::tempdir();
+        let storage = std::sync::Arc::new(std::sync::Mutex::new(
+            Storage::open(server_dir.path()).unwrap(),
+        ));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let _ = ciphra_net::serve(listener, storage);
+        });
+
+        let mut db =
+            Engine::open_remote_with_kdf(&addr, "remote-pass", KdfParams::Pbkdf2 { iterations: 2 })
+                .unwrap();
+        db.execute(
+            "CREATE TABLE t (id INT PRIMARY KEY, v TEXT ENCRYPTED); \
+             CREATE INDEX ON t (v); \
+             INSERT INTO t VALUES (1, 'wire-secret'), (2, 'x');",
+        )
+        .unwrap();
+        let rows = rows_of(db.execute("SELECT v FROM t WHERE id = 1").unwrap());
+        assert_eq!(rows, vec![vec![text("wire-secret")]]);
+        db.audit_verify().unwrap();
+
+        // A second client sees committed state; a wrong passphrase is
+        // rejected by the canary exactly as it is locally.
+        let mut second =
+            Engine::open_remote_with_kdf(&addr, "remote-pass", KdfParams::Pbkdf2 { iterations: 2 })
+                .unwrap();
+        assert_eq!(rows_of(second.execute("SELECT * FROM t").unwrap()).len(), 2);
+        let err = Engine::open_remote_with_kdf(&addr, "wrong", KdfParams::Pbkdf2 { iterations: 2 })
+            .err()
+            .expect("wrong passphrase must fail over the wire too");
+        assert!(matches!(err, EngineError::BadPassphrase), "got {err:?}");
+
+        // Server-side files contain no plaintext: the server is blind.
+        drop(db);
+        drop(second);
+        for entry in std::fs::read_dir(server_dir.path()).unwrap() {
+            let bytes = std::fs::read(entry.unwrap().path()).unwrap_or_default();
+            assert!(
+                !bytes.windows(11).any(|w| w == b"wire-secret"),
+                "plaintext reached the server"
+            );
+        }
+
+        // Backup works over the wire (dump + local snapshot write)...
+        let backup_dir = ciphra_testutil::tempdir();
+        let snapshot = backup_dir.path().join("remote.backup");
+        let db =
+            Engine::open_remote_with_kdf(&addr, "remote-pass", KdfParams::Pbkdf2 { iterations: 2 })
+                .unwrap();
+        db.backup_to(&snapshot).unwrap();
+        let restore_dir = ciphra_testutil::tempdir();
+        let mut restored =
+            Engine::restore_from(&snapshot, restore_dir.path(), "remote-pass").unwrap();
+        assert_eq!(
+            rows_of(restored.execute("SELECT * FROM t").unwrap()).len(),
+            2
+        );
+
+        // ...while rotation is honestly refused: it belongs to the host
+        // that owns the file.
+        let mut db = db;
+        let err = db
+            .rotate_to("np", KdfParams::Pbkdf2 { iterations: 2 })
+            .expect_err("remote rotation must be refused");
+        assert!(matches!(err, EngineError::Schema(_)), "got {err:?}");
     }
 
     #[test]

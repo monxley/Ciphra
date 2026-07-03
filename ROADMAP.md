@@ -57,7 +57,11 @@ later.
 
 ## Phase 3 — Multi-node and hardening
 
-- [ ] Wire protocol + Python/JS/Go drivers
+- [x] Wire protocol v1: blind-server storage protocol (ADR-0003),
+      `ciphra-server` binary + `--remote` client; plaintext and keys
+      never cross the wire
+- [ ] Python/JS/Go drivers (engine as a library over this protocol)
+- [ ] Transport security on the framing boundary (then ML-KEM)
 - [ ] Replication (log shipping first)
 - [ ] Post-quantum transport: ML-KEM key exchange, ML-DSA-signed
       audit roots

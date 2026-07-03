@@ -26,6 +26,7 @@ fn run() -> Result<ExitCode, String> {
     let mut rotate = false;
     let mut backup: Option<String> = None;
     let mut restore: Option<String> = None;
+    let mut remote: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -42,6 +43,9 @@ fn run() -> Result<ExitCode, String> {
             }
             "--restore" => {
                 restore = Some(args.next().ok_or("--restore requires a file argument")?);
+            }
+            "--remote" => {
+                remote = Some(args.next().ok_or("--remote requires host:port")?);
             }
             "--help" | "-h" => {
                 print_usage();
@@ -65,6 +69,14 @@ fn run() -> Result<ExitCode, String> {
         }
     };
 
+    if remote.is_some() && (restore.is_some() || rotate) {
+        return Err(
+            "--restore and --rotate-passphrase operate on the database file; \
+run them on the host that owns it"
+                .into(),
+        );
+    }
+
     if let Some(snapshot) = restore {
         let engine =
             Engine::restore_from(&snapshot, &data_dir, &passphrase).map_err(|e| e.to_string())?;
@@ -77,7 +89,10 @@ fn run() -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let mut engine = Engine::open(&data_dir, &passphrase).map_err(|e| e.to_string())?;
+    let mut engine = match &remote {
+        Some(addr) => Engine::open_remote(addr, &passphrase).map_err(|e| e.to_string())?,
+        None => Engine::open(&data_dir, &passphrase).map_err(|e| e.to_string())?,
+    };
 
     if let Some(path) = backup {
         engine.backup_to(&path).map_err(|e| e.to_string())?;
@@ -126,6 +141,7 @@ OPTIONS:
     -d, --data <DIR>     Data directory (default: {DEFAULT_DATA_DIR})
     -e, --execute <SQL>  Execute statements and exit (repeatable)
     --rotate-passphrase  Re-encrypt the database under {NEW_PASSPHRASE_ENV}
+    --remote <ADDR>      Connect to a ciphra-server instead of a local file
     --backup <FILE>      Write a sealed snapshot of the database
     --restore <FILE>     Restore a snapshot into --data (must be empty)
     -h, --help           Show this help
