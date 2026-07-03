@@ -97,6 +97,7 @@ impl Parser {
                 .as_str()
             {
                 "int" | "integer" => DataType::Int,
+                "real" | "float" | "double" => DataType::Real,
                 "text" | "varchar" => DataType::Text,
                 "vector" => {
                     self.expect(&Token::LParen)?;
@@ -316,6 +317,7 @@ impl Parser {
         let func = match name.as_str() {
             "count" => AggFunc::Count,
             "sum" => AggFunc::Sum,
+            "avg" => AggFunc::Avg,
             "min" => AggFunc::Min,
             "max" => AggFunc::Max,
             _ => return None,
@@ -431,13 +433,12 @@ impl Parser {
                 self.expect(&Token::RBracket)?;
                 Ok(Literal::Vector(components))
             }
-            Token::Float(_) => Err(ParseError(
-                "float literals are only supported inside vectors".into(),
-            )),
-            Token::Minus => match self.next("an integer")? {
+            Token::Float(x) => Ok(Literal::Real(x)),
+            Token::Minus => match self.next("a number")? {
                 Token::Int(n) => Ok(Literal::Int(-n)),
+                Token::Float(x) => Ok(Literal::Real(-x)),
                 other => Err(ParseError(format!(
-                    "expected an integer after '-', found {other}"
+                    "expected a number after '-', found {other}"
                 ))),
             },
             Token::Ident(kw) if kw == "null" => Ok(Literal::Null),

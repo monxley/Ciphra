@@ -308,6 +308,7 @@ const TABLE_TAG_LEN: usize = 16;
 pub enum Value {
     Null,
     Int(i64),
+    Real(f64),
     Text(String),
     Vector(Vec<f32>),
 }
@@ -317,6 +318,7 @@ impl std::fmt::Display for Value {
         match self {
             Value::Null => write!(f, "NULL"),
             Value::Int(n) => write!(f, "{n}"),
+            Value::Real(x) => write!(f, "{x}"),
             Value::Text(s) => write!(f, "{s}"),
             Value::Vector(v) => {
                 write!(f, "[")?;
@@ -2001,7 +2003,12 @@ enum AggPlan {
     GroupCol(usize),
     /// `COUNT(*)` (`None`) or `COUNT(col)` (`Some(idx)`, non-NULL count).
     Count(Option<usize>),
-    Sum(usize),
+    /// `SUM` over an INT column (exact, i128 accumulator).
+    SumInt(usize),
+    /// `SUM` over a REAL column (f64 accumulator).
+    SumReal(usize),
+    /// `AVG` over an INT or REAL column — always a REAL result.
+    Avg(usize),
     Min(usize),
     Max(usize),
 }
@@ -2010,7 +2017,9 @@ enum AggPlan {
 enum AggAcc {
     GroupCol,
     Count(i64),
-    Sum { total: i128, any: bool },
+    SumInt { total: i128, any: bool },
+    SumReal { total: f64, any: bool },
+    Avg { total: f64, count: i64 },
     Extreme(Option<Value>),
 }
 
@@ -2062,13 +2071,22 @@ fn aggregate(
                         let ty = schema.columns[idx].ty;
                         let plan = match func {
                             AggFunc::Count => AggPlan::Count(Some(idx)),
-                            AggFunc::Sum => {
-                                if !matches!(ty, DataType::Int) {
+                            AggFunc::Sum => match ty {
+                                DataType::Int => AggPlan::SumInt(idx),
+                                DataType::Real => AggPlan::SumReal(idx),
+                                _ => {
                                     return Err(EngineError::Type(format!(
-                                        "SUM({col}) requires an INT column"
+                                        "SUM({col}) requires an INT or REAL column"
                                     )));
                                 }
-                                AggPlan::Sum(idx)
+                            },
+                            AggFunc::Avg => {
+                                if !matches!(ty, DataType::Int | DataType::Real) {
+                                    return Err(EngineError::Type(format!(
+                                        "AVG({col}) requires an INT or REAL column"
+                                    )));
+                                }
+                                AggPlan::Avg(idx)
                             }
                             AggFunc::Min | AggFunc::Max => {
                                 if matches!(ty, DataType::Vector(_)) {
@@ -2099,9 +2117,17 @@ fn aggregate(
             .map(|p| match p {
                 AggPlan::GroupCol(_) => AggAcc::GroupCol,
                 AggPlan::Count(_) => AggAcc::Count(0),
-                AggPlan::Sum(_) => AggAcc::Sum {
+                AggPlan::SumInt(_) => AggAcc::SumInt {
                     total: 0,
                     any: false,
+                },
+                AggPlan::SumReal(_) => AggAcc::SumReal {
+                    total: 0.0,
+                    any: false,
+                },
+                AggPlan::Avg(_) => AggAcc::Avg {
+                    total: 0.0,
+                    count: 0,
                 },
                 AggPlan::Min(_) | AggPlan::Max(_) => AggAcc::Extreme(None),
             })
@@ -2137,7 +2163,7 @@ fn aggregate(
                         *c += 1;
                     }
                 }
-                (AggPlan::Sum(idx), AggAcc::Sum { total, any }) => match &row[*idx] {
+                (AggPlan::SumInt(idx), AggAcc::SumInt { total, any }) => match &row[*idx] {
                     Value::Null => {}
                     Value::Int(n) => {
                         *total += *n as i128;
@@ -2146,6 +2172,38 @@ fn aggregate(
                     other => {
                         return Err(EngineError::Type(format!(
                             "SUM encountered a non-integer value: {other}"
+                        )));
+                    }
+                },
+                (AggPlan::SumReal(idx), AggAcc::SumReal { total, any }) => match &row[*idx] {
+                    Value::Null => {}
+                    Value::Real(x) => {
+                        *total += *x;
+                        *any = true;
+                    }
+                    Value::Int(n) => {
+                        *total += *n as f64;
+                        *any = true;
+                    }
+                    other => {
+                        return Err(EngineError::Type(format!(
+                            "SUM encountered a non-numeric value: {other}"
+                        )));
+                    }
+                },
+                (AggPlan::Avg(idx), AggAcc::Avg { total, count }) => match &row[*idx] {
+                    Value::Null => {}
+                    Value::Real(x) => {
+                        *total += *x;
+                        *count += 1;
+                    }
+                    Value::Int(n) => {
+                        *total += *n as f64;
+                        *count += 1;
+                    }
+                    other => {
+                        return Err(EngineError::Type(format!(
+                            "AVG encountered a non-numeric value: {other}"
                         )));
                     }
                 },
@@ -2174,11 +2232,25 @@ fn aggregate(
             let value = match (plan, acc) {
                 (AggPlan::GroupCol(pos), _) => keyvals[*pos].clone(),
                 (_, AggAcc::Count(c)) => Value::Int(*c),
-                (_, AggAcc::Sum { total, any }) => {
+                (_, AggAcc::SumInt { total, any }) => {
                     if *any {
                         Value::Int(i64::try_from(*total).map_err(|_| {
                             EngineError::Type("SUM overflowed a 64-bit integer".into())
                         })?)
+                    } else {
+                        Value::Null
+                    }
+                }
+                (_, AggAcc::SumReal { total, any }) => {
+                    if *any {
+                        Value::Real(*total)
+                    } else {
+                        Value::Null
+                    }
+                }
+                (_, AggAcc::Avg { total, count }) => {
+                    if *count > 0 {
+                        Value::Real(*total / *count as f64)
                     } else {
                         Value::Null
                     }
@@ -2416,6 +2488,9 @@ fn coerce(literal: Literal, column: &ColumnDef) -> Result<Value> {
     match (literal, column.ty) {
         (Literal::Null, _) => Ok(Value::Null),
         (Literal::Int(n), DataType::Int) => Ok(Value::Int(n)),
+        (Literal::Real(x), DataType::Real) => Ok(Value::Real(x)),
+        // An integer literal widens into a REAL column.
+        (Literal::Int(n), DataType::Real) => Ok(Value::Real(n as f64)),
         (Literal::Text(s), DataType::Text) => Ok(Value::Text(s)),
         (Literal::Vector(v), DataType::Vector(dim)) => {
             if v.len() != dim as usize {
@@ -2457,6 +2532,11 @@ fn compare_values(a: &Value, b: &Value) -> Ordering {
         (Value::Null, _) => Ordering::Less,
         (_, Value::Null) => Ordering::Greater,
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Real(x), Value::Real(y)) => x.total_cmp(y),
+        // Mixed numeric comparison (e.g. an INT literal coerced against a
+        // REAL column, or vice versa): compare by value as f64.
+        (Value::Int(x), Value::Real(y)) => (*x as f64).total_cmp(y),
+        (Value::Real(x), Value::Int(y)) => x.total_cmp(&(*y as f64)),
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
         (Value::Vector(x), Value::Vector(y)) => {
             // Deterministic but meaningless; user-visible comparisons on
@@ -2466,8 +2546,8 @@ fn compare_values(a: &Value, b: &Value) -> Ordering {
             xb.cmp(&yb)
         }
         // Unreachable with typed columns; defined for totality.
-        (Value::Int(_), _) => Ordering::Less,
-        (_, Value::Int(_)) => Ordering::Greater,
+        (Value::Int(_) | Value::Real(_), _) => Ordering::Less,
+        (_, Value::Int(_) | Value::Real(_)) => Ordering::Greater,
         (Value::Text(_), _) => Ordering::Less,
         (_, Value::Text(_)) => Ordering::Greater,
     }
@@ -2507,6 +2587,7 @@ fn compile_expr(schema: &TableSchema, expr: Expr) -> Result<CompiledExpr> {
             value: match value {
                 Literal::Null => Value::Null,
                 Literal::Int(n) => Value::Int(n),
+                Literal::Real(x) => Value::Real(x),
                 Literal::Text(s) => Value::Text(s),
                 Literal::Vector(v) => Value::Vector(v),
             },
@@ -2548,6 +2629,11 @@ impl CompiledExpr {
                 let ordering = match (cell, value) {
                     (Value::Null, _) | (_, Value::Null) => return Ok(None),
                     (Value::Int(a), Value::Int(b)) => a.cmp(b),
+                    (Value::Real(a), Value::Real(b)) => a.total_cmp(b),
+                    // Mixed numeric comparison (INT column vs REAL literal
+                    // or a REAL column vs an INT literal).
+                    (Value::Int(a), Value::Real(b)) => (*a as f64).total_cmp(b),
+                    (Value::Real(a), Value::Int(b)) => a.total_cmp(&(*b as f64)),
                     (Value::Text(a), Value::Text(b)) => a.cmp(b),
                     (Value::Vector(_), _) | (_, Value::Vector(_)) => {
                         return Err(EngineError::Type(format!(
@@ -2693,6 +2779,65 @@ mod tests {
         assert!(db.execute("SELECT SUM(label) FROM t").is_err());
         assert!(db.execute("SELECT label, COUNT(*) FROM t").is_err());
         assert!(db.execute("SELECT COUNT(*) FROM t ORDER BY id").is_err());
+    }
+
+    fn real(x: f64) -> Value {
+        Value::Real(x)
+    }
+
+    #[test]
+    fn real_type_and_avg() {
+        let dir = ciphra_testutil::tempdir();
+        let mut db = engine(dir.path());
+        db.execute("CREATE TABLE m (id INT PRIMARY KEY, price REAL, cat TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO m VALUES (1,1.0,'a'),(2,2.0,'a'),(3,3.0,'b')")
+            .unwrap();
+
+        // REAL values persist and compare (with int-literal coercion).
+        assert_eq!(
+            rows_of(
+                db.execute("SELECT price FROM m WHERE price >= 2.0")
+                    .unwrap()
+            ),
+            vec![vec![real(2.0)], vec![real(3.0)]]
+        );
+        assert_eq!(
+            rows_of(db.execute("SELECT price FROM m WHERE price = 2").unwrap()),
+            vec![vec![real(2.0)]]
+        );
+
+        // AVG returns REAL; over an INT column too. SUM(REAL) is REAL.
+        assert_eq!(
+            rows_of(
+                db.execute("SELECT AVG(price), SUM(price), AVG(id) FROM m")
+                    .unwrap()
+            ),
+            vec![vec![real(2.0), real(6.0), real(2.0)]]
+        );
+
+        // Grouped aggregates over REAL.
+        assert_eq!(
+            rows_of(
+                db.execute("SELECT cat, AVG(price), MIN(price), MAX(price) FROM m GROUP BY cat")
+                    .unwrap()
+            ),
+            vec![
+                vec![text("a"), real(1.5), real(1.0), real(2.0)],
+                vec![text("b"), real(3.0), real(3.0), real(3.0)],
+            ]
+        );
+
+        // AVG/SUM over a TEXT column is a type error.
+        assert!(db.execute("SELECT AVG(cat) FROM m").is_err());
+
+        // REAL survives a reopen (codec round-trip).
+        drop(db);
+        let mut db = engine(dir.path());
+        assert_eq!(
+            rows_of(db.execute("SELECT price FROM m WHERE id = 3").unwrap()),
+            vec![vec![real(3.0)]]
+        );
     }
 
     #[test]
