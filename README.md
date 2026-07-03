@@ -81,13 +81,16 @@ rather than add-ons.
   and `ORDER BY emb NEAREST TO [0.1, ...] LIMIT k` — exact cosine
   similarity computed over sealed rows, so Ciphra doubles as an
   encrypted vector store for RAG workloads.
-- **Tamper-evident audit chain, post-quantum signed**: every mutating
-  statement appends a sealed hash-chain entry in the same atomic commit
-  as its data. `.audit verify` re-checks all of history; `.audit sign`
-  signs the current root with **ML-DSA-65** (FIPS 204, from scratch)
-  under a key derived from the passphrase — publish the signature and
-  anyone can verify offline, with no passphrase and no way for a quantum
-  adversary to forge a rolled-back root.
+- **Tamper-evident audit chain, post-quantum signed, with inclusion
+  proofs**: every mutating statement appends a sealed hash-chain entry
+  in the same atomic commit as its data. `.audit verify` re-checks all
+  of history; `.audit sign` signs the current root with **ML-DSA-65**
+  (FIPS 204, from scratch) under a key derived from the passphrase —
+  publish the signature and anyone can verify offline, with no
+  passphrase and no way for a quantum adversary to forge a rolled-back
+  root. `.audit prove <n>` emits an **O(log n) Merkle inclusion proof**:
+  a compact, publicly verifiable receipt that one specific statement is
+  recorded in history, checkable against the signed Merkle root.
 - **Key rotation**: `ciphra --rotate-passphrase` re-encrypts the whole
   database under a new passphrase (new salt, new KDF, new table and
   index tags) with an atomic file swap — a crash cannot strand the
@@ -162,6 +165,7 @@ ciphra> .audit verify           -- re-check the whole tamper-evident chain
 ciphra> .audit root             -- print the current audit root to publish
 ciphra> .audit sign             -- ML-DSA-65 signature over the root (post-quantum)
 ciphra> .audit pubkey           -- the audit signing public key (publish once)
+ciphra> .audit prove 2          -- Merkle inclusion proof that entry 2 is in history
 ciphra> .help                   -- SQL cheatsheet
 ciphra> .exit
 ```

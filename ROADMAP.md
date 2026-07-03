@@ -47,7 +47,8 @@ later.
 - [x] Tamper-evident audit chain: sealed hash-chain entry per
       statement, committed atomically with its data; `.audit
       root`/`.audit verify`; rollback detection via external roots.
-      (Merkle tree for O(log n) inclusion proofs: planned upgrade)
+      Merkle tree over the entries gives O(log n) inclusion proofs
+      (`.audit prove <n>`), verifiable against the signed Merkle root.
 - [x] `VECTOR(dim)` type + `ORDER BY col NEAREST TO [..]` similarity
       search: exact brute-force cosine over sealed rows (sealed-blob
       ANN index for large corpora: planned)
