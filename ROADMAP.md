@@ -60,7 +60,9 @@ later.
 - [x] Wire protocol v1: blind-server storage protocol (ADR-0003),
       `ciphra-server` binary + `--remote` client; plaintext and keys
       never cross the wire
-- [ ] Python/JS/Go drivers (engine as a library over this protocol)
+- [x] Python/JS/Go drivers: a C ABI (`ciphra-ffi`) runs the engine
+      in-process; thin stdlib-only bindings (`ctypes`, `cgo`, `bun:ffi`),
+      local and remote, keys never leaving the client (drivers/)
 - [x] Transport security: hybrid X25519 + ML-KEM-768 handshake
       (SHA-3/SHAKE, X25519 RFC 7748, ML-KEM-768 FIPS 203 — all from
       scratch), forward-secret + server-authenticated encrypted

@@ -15,6 +15,7 @@ live in [docs/adr/](docs/adr/).
 | `ciphra-net` | Remote-storage protocol: blind server + client (ADR-0003) | storage |
 | `ciphra-server` | Server binary — stores sealed bytes, holds no keys | net, storage |
 | `ciphra` | CLI / REPL binary | engine |
+| `ciphra-ffi` | C ABI over the engine (`cdylib`/`staticlib`); the core language drivers link against | engine |
 | `ciphra-testutil` | Test-only temp-dir helper | — |
 
 `ciphra-server` deliberately cannot depend on `ciphra-crypto`: the

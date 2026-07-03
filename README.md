@@ -102,6 +102,12 @@ rather than add-ons.
   in order, and applies them into its own store. Since the whole stream
   is sealed bytes, the replica is as blind as the leader: it mirrors the
   ciphertext without ever seeing a key. Replicas can be chained.
+- **Language drivers for Python, Go and JavaScript**: a small C ABI
+  (`ciphra-ffi`) exposes the engine so each driver runs the *real* Rust
+  engine in-process — encryption and keys stay on the client, and for a
+  remote database only sealed bytes reach the blind server. Each binding
+  is standard-library only (`ctypes`, `cgo`, `bun:ffi`), no packages to
+  install. See [drivers/](drivers/).
 - **Sealed backup/restore**: `--backup file` exports one
   self-contained encrypted snapshot (audit chain included);
   `--restore file` verifies the passphrase and the chain before use.
@@ -225,6 +231,27 @@ read-only for clients and as blind as the leader.
 # Clients can read from the replica (writes are refused there):
 ./target/release/ciphra --remote 127.0.0.1:5078 --server-key <replica-key>
 ```
+
+### Language drivers (Python / Go / JavaScript)
+
+Embed Ciphra in your app through a thin, dependency-free binding over
+`libciphra`. The engine runs in-process, so keys and plaintext stay on
+the client; for a remote database only sealed bytes reach the server.
+
+```sh
+cargo build --release -p ciphra-ffi   # builds libciphra the drivers link against
+```
+
+```python
+from ciphra import Ciphra                       # drivers/python (ctypes)
+with Ciphra.open("./mydb", "pick a long passphrase") as db:
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, note TEXT ENCRYPTED)")
+    db.execute("INSERT INTO t VALUES (1, 'hello')")
+    print(db.query("SELECT id, note FROM t"))    # [{'id': 1, 'note': 'hello'}]
+```
+
+Go (`cgo`) and JavaScript (Bun, `bun:ffi`) drivers expose the same API —
+see [drivers/README.md](drivers/README.md).
 
 ## Architecture
 

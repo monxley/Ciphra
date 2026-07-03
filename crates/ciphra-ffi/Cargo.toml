@@ -1,0 +1,16 @@
+[package]
+name = "ciphra-ffi"
+description = "C ABI over the Ciphra engine: the shared core every language driver links against"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "ciphra"
+# cdylib for ctypes/bun:ffi (dlopen); staticlib for Go cgo static linking.
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+ciphra-engine.workspace = true
