@@ -304,6 +304,15 @@ primary specifications and pass official test vectors, but until an
 external audit lands, treat this as a development-grade system. Found
 something? Please open a security advisory rather than a public issue.
 
+## Support the project
+
+Ciphra is built in the open with no third-party dependencies. If it is
+useful to you, donations help fund the work toward an external security
+audit:
+
+- **BTC** — `bc1qlakzxqgaahuqf7newzfc4dfnhk4knnm4pht6q3`
+- **ETH** — `0x6be4c971f7c7e765ab92a9f1eed4098ffdf77805`
+
 ## License
 
 [Apache-2.0](LICENSE)
