@@ -98,6 +98,8 @@ pub struct ColumnDef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
     Int,
+    /// 64-bit IEEE-754 floating point.
+    Real,
     Text,
     /// Fixed-dimension f32 embedding, e.g. `VECTOR(384)`.
     Vector(u16),
@@ -107,6 +109,8 @@ pub enum DataType {
 pub enum Literal {
     Null,
     Int(i64),
+    /// A floating-point literal, e.g. `3.14`.
+    Real(f64),
     Text(String),
     /// `[0.1, -2.5, 3]` — components may be written as ints or floats.
     Vector(Vec<f32>),
@@ -136,6 +140,7 @@ pub enum SelectItem {
 pub enum AggFunc {
     Count,
     Sum,
+    Avg,
     Min,
     Max,
 }
@@ -153,6 +158,7 @@ impl AggFunc {
         match self {
             AggFunc::Count => "COUNT",
             AggFunc::Sum => "SUM",
+            AggFunc::Avg => "AVG",
             AggFunc::Min => "MIN",
             AggFunc::Max => "MAX",
         }
@@ -190,6 +196,7 @@ impl std::fmt::Display for Literal {
         match self {
             Literal::Null => write!(f, "NULL"),
             Literal::Int(n) => write!(f, "{n}"),
+            Literal::Real(x) => write!(f, "{x}"),
             Literal::Text(s) => write!(f, "'{}'", s.replace('\'', "''")),
             Literal::Vector(v) => {
                 write!(f, "[")?;

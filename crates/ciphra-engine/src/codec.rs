@@ -12,6 +12,7 @@ const TAG_NULL: u8 = 0;
 const TAG_INT: u8 = 1;
 const TAG_TEXT: u8 = 2;
 const TAG_VECTOR: u8 = 3;
+const TAG_REAL: u8 = 4;
 
 /// Table schema as stored in the catalog.
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +56,7 @@ pub fn encode_schema(schema: &TableSchema) -> Vec<u8> {
         out.push(flags);
         match col.ty {
             DataType::Int => out.push(TAG_INT),
+            DataType::Real => out.push(TAG_REAL),
             DataType::Text => out.push(TAG_TEXT),
             DataType::Vector(dim) => {
                 out.push(TAG_VECTOR);
@@ -96,6 +98,7 @@ pub fn decode_schema(buf: &[u8]) -> Result<TableSchema> {
         let mut extra = 0usize;
         let ty = match buf[pos + 1] {
             TAG_INT => DataType::Int,
+            TAG_REAL => DataType::Real,
             TAG_TEXT => DataType::Text,
             TAG_VECTOR => {
                 if buf.len() < pos + 6 {
@@ -143,6 +146,10 @@ pub fn encode_row(values: &[Value]) -> Vec<u8> {
                 out.push(TAG_INT);
                 out.extend_from_slice(&n.to_le_bytes());
             }
+            Value::Real(x) => {
+                out.push(TAG_REAL);
+                out.extend_from_slice(&x.to_le_bytes());
+            }
             Value::Text(s) => {
                 out.push(TAG_TEXT);
                 out.extend_from_slice(&(s.len() as u32).to_le_bytes());
@@ -180,6 +187,15 @@ pub fn decode_row(buf: &[u8]) -> Result<Vec<Value>> {
                     .try_into()
                     .unwrap();
                 values.push(Value::Int(i64::from_le_bytes(bytes)));
+                pos += 8;
+            }
+            TAG_REAL => {
+                let bytes: [u8; 8] = buf
+                    .get(pos..pos + 8)
+                    .ok_or_else(corrupt)?
+                    .try_into()
+                    .unwrap();
+                values.push(Value::Real(f64::from_le_bytes(bytes)));
                 pos += 8;
             }
             TAG_TEXT => {

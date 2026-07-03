@@ -321,6 +321,13 @@ fn encode_value(out: &mut String, value: &Value) {
     match value {
         Value::Null => out.push_str("null"),
         Value::Int(n) => out.push_str(&n.to_string()),
+        Value::Real(x) => {
+            if x.is_finite() {
+                out.push_str(&x.to_string());
+            } else {
+                out.push_str("null"); // NaN/inf aren't valid JSON numbers
+            }
+        }
         Value::Text(s) => encode_str(out, s),
         Value::Vector(v) => {
             out.push('[');

@@ -353,6 +353,7 @@ All rows are ChaCha20-Poly1305 encrypted before they reach disk."
                     for col in &schema.columns {
                         let ty = match col.ty {
                             DataType::Int => "INT".to_string(),
+                            DataType::Real => "REAL".to_string(),
                             DataType::Text => "TEXT".to_string(),
                             DataType::Vector(dim) => format!("VECTOR({dim})"),
                         };
