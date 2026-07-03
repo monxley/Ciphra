@@ -130,6 +130,34 @@ const AUDIT_PREFIX: &[u8] = b"a\x00";
 const AUDIT_HEAD_KEY: &[u8] = b"\x00audit";
 /// Fixed size of a serialized audit entry (see [`AuditEntry`]).
 const AUDIT_ENTRY_LEN: usize = 8 + 8 + 1 + 16 + 32 + 32;
+/// HKDF context for the deterministic ML-DSA audit-signing seed.
+const AUDIT_SIGNING_CONTEXT: &str = "audit-signing";
+/// Domain-separation prefix for the signed audit-root message.
+const AUDIT_ROOT_MESSAGE_TAG: &[u8] = b"ciphra/audit-root/v1";
+
+/// An ML-DSA signature over an audit root, plus everything needed to
+/// verify it. Self-contained and safe to publish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedAuditRoot {
+    /// Number of entries the root commits to.
+    pub seq: u64,
+    /// The audit root (chain head hash).
+    pub root: [u8; 32],
+    /// ML-DSA public key (derived from the passphrase; publish once).
+    pub public_key: Vec<u8>,
+    /// ML-DSA signature over `(tag ∥ seq ∥ root)`.
+    pub signature: Vec<u8>,
+}
+
+/// The canonical message signed for an audit root: a domain-separation
+/// tag, the sequence number and the root hash.
+fn audit_root_message(seq: u64, root: &[u8; 32]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(AUDIT_ROOT_MESSAGE_TAG.len() + 8 + 32);
+    msg.extend_from_slice(AUDIT_ROOT_MESSAGE_TAG);
+    msg.extend_from_slice(&seq.to_le_bytes());
+    msg.extend_from_slice(root);
+    msg
+}
 
 /// Statement kinds recorded in the audit chain.
 pub mod audit_kind {
@@ -584,6 +612,46 @@ impl Engine {
             ));
         }
         Ok(entries)
+    }
+
+    /// The ML-DSA public key for this database's audit-root signatures.
+    ///
+    /// Deterministically derived from the passphrase (never stored), so
+    /// publishing it once lets anyone verify every future signed root
+    /// offline — with post-quantum security (FIPS 204).
+    pub fn audit_signing_public_key(&self) -> Vec<u8> {
+        let seed = self.master.derive_seed(AUDIT_SIGNING_CONTEXT);
+        ciphra_crypto::mldsa_keypair_from_seed(&seed).0
+    }
+
+    /// Sign the current audit root with ML-DSA. The result is
+    /// self-contained: `(seq, root)`, the public key and the signature.
+    /// Publish it, and any later rollback of the database becomes
+    /// detectable by anyone — no passphrase needed to verify, and no
+    /// quantum computer can forge it.
+    pub fn sign_audit_root(&self) -> SignedAuditRoot {
+        let (seq, root) = self.audit_head;
+        let seed = self.master.derive_seed(AUDIT_SIGNING_CONTEXT);
+        let (public_key, secret_key) = ciphra_crypto::mldsa_keypair_from_seed(&seed);
+        let signature = ciphra_crypto::mldsa_sign(&secret_key, &audit_root_message(seq, &root));
+        SignedAuditRoot {
+            seq,
+            root,
+            public_key,
+            signature,
+        }
+    }
+
+    /// Verify a [`SignedAuditRoot`] against a published public key. This
+    /// is a pure function — it needs neither the database nor the
+    /// passphrase, so an external auditor can run it with only the public
+    /// key, the claimed `(seq, root)` and the signature.
+    pub fn verify_audit_root(signed: &SignedAuditRoot, public_key: &[u8]) -> bool {
+        ciphra_crypto::mldsa_verify(
+            public_key,
+            &audit_root_message(signed.seq, &signed.root),
+            &signed.signature,
+        )
     }
 
     /// Re-encrypt the whole database under a new passphrase (and KDF).
@@ -3013,6 +3081,40 @@ mod tests {
         let db = engine(dir.path());
         assert_eq!(db.audit_root(), (seq, root));
         db.audit_verify().unwrap();
+    }
+
+    #[test]
+    fn audit_root_signature_verifies_and_rejects_forgery() {
+        let dir = ciphra_testutil::tempdir();
+        let mut db = engine(dir.path());
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+        let signed = db.sign_audit_root();
+        let pubkey = db.audit_signing_public_key();
+        assert_eq!(signed.public_key, pubkey);
+        assert_eq!((signed.seq, signed.root), db.audit_root());
+
+        // Anyone with the published key verifies without the passphrase.
+        assert!(Engine::verify_audit_root(&signed, &pubkey));
+
+        // A rolled-back root (wrong seq) under the same signature fails.
+        let mut rolled_back = signed.clone();
+        rolled_back.seq = 0;
+        assert!(!Engine::verify_audit_root(&rolled_back, &pubkey));
+
+        // A tampered root fails.
+        let mut tampered = signed.clone();
+        tampered.root[0] ^= 0x01;
+        assert!(!Engine::verify_audit_root(&tampered, &pubkey));
+
+        // The signing key is deterministic across reopen: same public key,
+        // and a fresh signature still verifies against the old one's key.
+        drop(db);
+        let db = engine(dir.path());
+        assert_eq!(db.audit_signing_public_key(), pubkey);
+        assert!(Engine::verify_audit_root(&db.sign_audit_root(), &pubkey));
     }
 
     #[test]

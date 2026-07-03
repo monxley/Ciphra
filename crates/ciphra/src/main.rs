@@ -173,7 +173,8 @@ ENVIRONMENT:
 REPL COMMANDS:
     .tables              List tables
     .schema <table>      Show a table's schema
-    .audit [root|verify] Show or verify the tamper-evident audit chain
+    .audit [root|verify|sign|pubkey]
+                         Show/verify the audit chain, or ML-DSA-sign its root
     .help                Show SQL help
     .exit                Quit"
     );
@@ -293,7 +294,24 @@ All rows are ChaCha20-Poly1305 encrypted before they reach disk."
                 }
                 Err(e) => eprintln!("{e}"),
             },
-            Some(other) => eprintln!("unknown subcommand: .audit {other} (root|verify)"),
+            Some("pubkey") => {
+                println!("audit signing public key (ML-DSA-65, publish once):");
+                println!("{}", hex(&engine.audit_signing_public_key()));
+            }
+            Some("sign") => {
+                let signed = engine.sign_audit_root();
+                println!("audit root signature (ML-DSA-65, post-quantum):");
+                println!("  seq:       {}", signed.seq);
+                println!("  root:      {}", hex(&signed.root));
+                println!("  publickey: {}", hex(&signed.public_key));
+                println!("  signature: {}", hex(&signed.signature));
+                println!(
+                    "(anyone with the public key can verify these offline — no passphrase needed)"
+                );
+            }
+            Some(other) => {
+                eprintln!("unknown subcommand: .audit {other} (root|verify|sign|pubkey)")
+            }
         },
         ".tables" => match engine.tables() {
             Ok(tables) if tables.is_empty() => println!("(no tables)"),

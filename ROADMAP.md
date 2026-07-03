@@ -72,7 +72,11 @@ later.
       sealed snapshot, then ordered sealed batches — and applies them
       into its own blind store; replicas can be chained
 - [x] Post-quantum key exchange (ML-KEM) — done in the transport above
-- [ ] ML-DSA-signed audit roots (post-quantum signatures)
+- [x] ML-DSA-signed audit roots: ML-DSA-65 (FIPS 204) implemented from
+      scratch; `.audit sign` signs the current root with a key
+      deterministically derived from the passphrase, so a published root
+      is verifiable offline by anyone (no passphrase) and unforgeable by
+      a quantum adversary
 - [ ] Optional build against audited crypto implementations
 - [ ] External security audit — a release blocker for 1.0
 

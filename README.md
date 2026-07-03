@@ -74,17 +74,20 @@ rather than add-ons.
   the sealed catalog record.
 - **Zero third-party dependencies.** The entire engine — including
   SHA-256, HMAC, HKDF, PBKDF2, ChaCha20, Poly1305, BLAKE2b, Argon2id,
-  SHA-3/SHAKE, X25519 and ML-KEM-768 — is implemented in this
+  SHA-3/SHAKE, X25519, ML-KEM-768 and ML-DSA-65 — is implemented in this
   repository and verified against official RFC/NIST/FIPS test vectors.
   The supply chain is: the Rust standard library, and this repo.
 - **Vector search over encrypted embeddings**: `VECTOR(dim)` columns
   and `ORDER BY emb NEAREST TO [0.1, ...] LIMIT k` — exact cosine
   similarity computed over sealed rows, so Ciphra doubles as an
   encrypted vector store for RAG workloads.
-- **Tamper-evident audit chain**: every mutating statement appends a
-  sealed hash-chain entry in the same atomic commit as its data.
-  `.audit verify` re-checks all of history; publish `.audit root`
-  externally and any rollback of the database file becomes detectable.
+- **Tamper-evident audit chain, post-quantum signed**: every mutating
+  statement appends a sealed hash-chain entry in the same atomic commit
+  as its data. `.audit verify` re-checks all of history; `.audit sign`
+  signs the current root with **ML-DSA-65** (FIPS 204, from scratch)
+  under a key derived from the passphrase — publish the signature and
+  anyone can verify offline, with no passphrase and no way for a quantum
+  adversary to forge a rolled-back root.
 - **Key rotation**: `ciphra --rotate-passphrase` re-encrypts the whole
   database under a new passphrase (new salt, new KDF, new table and
   index tags) with an atomic file swap — a crash cannot strand the
@@ -157,6 +160,8 @@ ciphra> .tables                 -- list tables
 ciphra> .schema users           -- show a table's columns
 ciphra> .audit verify           -- re-check the whole tamper-evident chain
 ciphra> .audit root             -- print the current audit root to publish
+ciphra> .audit sign             -- ML-DSA-65 signature over the root (post-quantum)
+ciphra> .audit pubkey           -- the audit signing public key (publish once)
 ciphra> .help                   -- SQL cheatsheet
 ciphra> .exit
 ```

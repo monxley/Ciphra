@@ -102,6 +102,16 @@ v1 is a linear hash chain — the degenerate Merkle case; a tree for
 O(log n) inclusion proofs is the planned upgrade and changes no on-disk
 entry, only adds structure above it.
 
+**Signed roots (post-quantum).** `.audit sign` signs the current
+`(seq, root)` with ML-DSA-65 (FIPS 204). The signing key is derived
+deterministically from the passphrase (`derive_seed` → ML-DSA keygen),
+so it is reproducible and never stored; the public key is published
+once. This upgrades rollback detection from "compare against a value you
+recorded" to "verify a signature anyone can check" — the verifier needs
+only the public key, not the passphrase or the database, and a quantum
+adversary still cannot forge a signature over a rolled-back root. The
+message is domain-separated (`"ciphra/audit-root/v1" ∥ seq ∥ root`).
+
 ### Sealing
 
 Envelope: `nonce (12, random per seal) | ciphertext | tag (16)` using
@@ -165,13 +175,16 @@ The static transport key authenticates the server but **cannot decrypt
 stored data** — it is unrelated to the passphrase-derived data keys, so
 the server stays blind (ADR-0003).
 
-Honesty note on ML-KEM: it is implemented from FIPS 203's clean
-formulation and verified here for internal consistency — the NTT is
-checked against a schoolbook negacyclic convolution (pinning every zeta
-and gamma) and the full KEM round-trips with implicit rejection. This
-build has no network to pull the official ACVP known-answer vectors, so
-byte-exact cross-implementation interop is on the audit checklist, not
-yet claimed.
+Honesty note on ML-KEM and ML-DSA: both are implemented from the clean
+FIPS 203 / FIPS 204 formulations and verified here for internal
+consistency — each NTT is checked against a schoolbook negacyclic
+convolution (pinning every zeta), the KEM round-trips with implicit
+rejection, and ML-DSA-65 keygen→sign→verify round-trips while a tampered
+message, signature or key is rejected (deterministic signing, so results
+are reproducible). This build has no network to pull the official ACVP
+known-answer vectors, so byte-exact cross-implementation interop is on
+the audit checklist, not yet claimed — but a wrong parameter, zeta,
+sampling or packing step fails the tests here.
 
 ### Replication (log shipping)
 
