@@ -75,6 +75,12 @@ pub enum Statement {
     /// `EXPLAIN <select|update|delete>` — describe the access path
     /// without executing the statement.
     Explain(Box<Statement>),
+    /// `BEGIN` / `START TRANSACTION` — open a transaction.
+    Begin,
+    /// `COMMIT` — commit the open transaction atomically.
+    Commit,
+    /// `ROLLBACK` — discard the open transaction.
+    Rollback,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -657,6 +663,17 @@ mod tests {
             unreachable!()
         };
         assert_eq!(columns, Projection::Columns(vec!["count".into()]));
+    }
+
+    #[test]
+    fn parses_transaction_control() {
+        assert_eq!(one("BEGIN"), Statement::Begin);
+        assert_eq!(one("BEGIN TRANSACTION"), Statement::Begin);
+        assert_eq!(one("START TRANSACTION"), Statement::Begin);
+        assert_eq!(one("COMMIT"), Statement::Commit);
+        assert_eq!(one("COMMIT WORK"), Statement::Commit);
+        assert_eq!(one("ROLLBACK"), Statement::Rollback);
+        assert!(parse_statements("START").is_err()); // START needs TRANSACTION
     }
 
     #[test]

@@ -294,6 +294,9 @@ fn encode_result(out: &mut String, result: &QueryResult) {
             }
             out.push_str("]}");
         }
+        QueryResult::Begin => out.push_str("{\"kind\":\"begin\"}"),
+        QueryResult::Committed => out.push_str("{\"kind\":\"committed\"}"),
+        QueryResult::RolledBack => out.push_str("{\"kind\":\"rolled_back\"}"),
     }
 }
 

@@ -22,6 +22,9 @@ later.
 - [x] Aggregates `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` with `GROUP BY` and
       `HAVING` (computed in the engine over decrypted rows; same leakage
       as a plain `SELECT`), and a `REAL` (f64) column type
+- [x] Transactions: `BEGIN`/`COMMIT`/`ROLLBACK` — buffered
+      read-your-writes flushed as one atomic WAL batch on commit, or
+      discarded on rollback (a transaction overlay inside `Store`)
 - [x] Encrypted table names via opaque keyed tags (no user plaintext
       on disk at all)
 - [x] Primary keys: uniqueness + non-NULL enforcement, point lookups
@@ -107,6 +110,11 @@ a 1.0 release blocker, not a code task._
 
 ## Non-goals (v0–v2)
 
-- MySQL/Postgres wire compatibility (revisit at Phase 3)
-- Distributed transactions
+- MySQL/Postgres wire compatibility — only viable as a local key-holding
+  front-end (the blind server has no keys and cannot execute queries);
+  not yet built
+- *Distributed* transactions (cross-node 2PC/consensus) — does not fit
+  the single-writer + log-shipping model. Local `BEGIN`/`COMMIT`/
+  `ROLLBACK` transactions are implemented (Phase 1); distributed commit
+  is not a goal
 - Being the fastest database in any benchmark that ignores encryption

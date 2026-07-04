@@ -496,6 +496,9 @@ fn print_result(result: &QueryResult) {
         QueryResult::Updated(n) => println!("updated {n} row{}", plural(*n)),
         QueryResult::Deleted(n) => println!("deleted {n} row{}", plural(*n)),
         QueryResult::Rows { columns, rows } => print_table(columns, rows),
+        QueryResult::Begin => println!("BEGIN"),
+        QueryResult::Committed => println!("COMMIT"),
+        QueryResult::RolledBack => println!("ROLLBACK"),
     }
 }
 
