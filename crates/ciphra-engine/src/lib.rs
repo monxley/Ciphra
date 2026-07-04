@@ -48,7 +48,9 @@
 
 mod codec;
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub use ciphra_sql::{ColumnDef, DataType};
@@ -466,6 +468,46 @@ pub struct Engine {
     dir: Option<PathBuf>,
     /// Cached audit head: (next sequence number, current chain root).
     audit_head: (u64, [u8; 32]),
+    /// In-memory query telemetry for the index advisor. Never persisted:
+    /// it describes *which columns are queried*, which is itself
+    /// sensitive, so it lives only for the process's lifetime.
+    advisor: RefCell<Advisor>,
+}
+
+/// Per-column query telemetry: how a column has been used in `WHERE`.
+#[derive(Default, Clone)]
+struct ColStat {
+    /// Equality predicates seen (`col = …`).
+    eq: u64,
+    /// Range predicates seen (`col <|<=|>|>= …`).
+    range: u64,
+    /// Rows examined by full scans of queries that filtered on this
+    /// column — a cost proxy: a filter that keeps forcing big scans is a
+    /// stronger index candidate than one over a tiny table.
+    scan_rows: u64,
+}
+
+/// Accumulated query telemetry, keyed by `(table, column)`.
+#[derive(Default)]
+struct Advisor {
+    queries: u64,
+    stats: BTreeMap<(String, String), ColStat>,
+}
+
+/// One index recommendation from [`Engine::advise`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexAdvice {
+    pub table: String,
+    pub column: String,
+    /// `true` for a range index (`CREATE RANGE INDEX`), else an equality
+    /// index (`CREATE INDEX`).
+    pub range: bool,
+    /// How many predicates of the relevant class were observed.
+    pub predicates: u64,
+    /// Rows scanned by queries that filtered on this column.
+    pub scan_rows: u64,
+    /// The DDL statement that would create the suggested index.
+    pub statement: String,
 }
 
 impl Engine {
@@ -595,6 +637,7 @@ impl Engine {
             master,
             dir,
             audit_head,
+            advisor: RefCell::new(Advisor::default()),
         })
     }
 
@@ -1837,6 +1880,86 @@ impl Engine {
     /// conjunct on the primary key or a `CREATE INDEX` column), this is
     /// an index lookup instead of a full scan. Callers still apply the
     /// complete predicate to what is returned.
+    /// Record one query's predicate usage for the index advisor.
+    /// `scanned` is the number of rows a full scan examined (0 for an
+    /// index path). Columns are de-duplicated within a query.
+    fn record_query(&self, table: &str, filter: &CompiledExpr, scanned: u64) {
+        let mut eq = std::collections::HashSet::new();
+        let mut range = std::collections::HashSet::new();
+        collect_predicates(filter, &mut eq, &mut range);
+        if eq.is_empty() && range.is_empty() {
+            return;
+        }
+        let mut advisor = self.advisor.borrow_mut();
+        advisor.queries += 1;
+        for col in eq {
+            let stat = advisor.stats.entry((table.to_string(), col)).or_default();
+            stat.eq += 1;
+            stat.scan_rows += scanned;
+        }
+        for col in range {
+            let stat = advisor.stats.entry((table.to_string(), col)).or_default();
+            stat.range += 1;
+            stat.scan_rows += scanned;
+        }
+    }
+
+    /// Index recommendations from the query telemetry gathered this
+    /// session: columns filtered by equality without an index, or by
+    /// range without a range index. Ranked by scan cost then frequency.
+    /// Pure advice — it creates nothing.
+    pub fn advise(&self) -> Result<Vec<IndexAdvice>> {
+        let advisor = self.advisor.borrow();
+        let mut out = Vec::new();
+        for ((table, column), stat) in &advisor.stats {
+            let Some(schema) = self.schema(table)? else {
+                continue; // table dropped since it was queried
+            };
+            let Some(ci) = schema.column_index(column) else {
+                continue;
+            };
+            let col = &schema.columns[ci];
+            if stat.eq > 0 && !col.indexed && !col.primary_key {
+                out.push(IndexAdvice {
+                    table: table.clone(),
+                    column: column.clone(),
+                    range: false,
+                    predicates: stat.eq,
+                    scan_rows: stat.scan_rows,
+                    statement: format!("CREATE INDEX ON {table} ({column})"),
+                });
+            }
+            if stat.range > 0 && !col.range_indexed {
+                out.push(IndexAdvice {
+                    table: table.clone(),
+                    column: column.clone(),
+                    range: true,
+                    predicates: stat.range,
+                    scan_rows: stat.scan_rows,
+                    statement: format!("CREATE RANGE INDEX ON {table} ({column})"),
+                });
+            }
+        }
+        out.sort_by(|a, b| {
+            b.scan_rows
+                .cmp(&a.scan_rows)
+                .then(b.predicates.cmp(&a.predicates))
+                .then(a.table.cmp(&b.table))
+                .then(a.column.cmp(&b.column))
+        });
+        Ok(out)
+    }
+
+    /// Number of predicate-bearing queries observed since the last reset.
+    pub fn advisor_query_count(&self) -> u64 {
+        self.advisor.borrow().queries
+    }
+
+    /// Forget all collected query telemetry.
+    pub fn advisor_reset(&self) {
+        *self.advisor.borrow_mut() = Advisor::default();
+    }
+
     fn candidate_rows(
         &self,
         table: &str,
@@ -1860,6 +1983,7 @@ impl Engine {
                     }
                 }
             }
+            self.record_query(table, filter, 0); // index lookup: no scan cost
             return Ok(rows);
         }
         if let Some(filter) = filter
@@ -1886,12 +2010,17 @@ impl Engine {
                     rows.push((key, row));
                 }
             }
+            self.record_query(table, filter, 0); // range index: no full scan
             return Ok(rows);
         }
         let mut rows = Vec::new();
         for (key, sealed) in self.store.scan_prefix(&self.row_prefix(table))? {
             let row = codec::decode_row(&table_key.open(&sealed, &key)?)?;
             rows.push((key, row));
+        }
+        // Full scan: attribute the examined-row cost to the filtered cols.
+        if let Some(filter) = filter {
+            self.record_query(table, filter, rows.len() as u64);
         }
         Ok(rows)
     }
@@ -2686,6 +2815,35 @@ fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     (1.0 - dot / (norm_a.sqrt() * norm_b.sqrt())) as f32
 }
 
+/// Walk a compiled predicate, collecting the columns compared by
+/// equality (`=`) and by range (`< <= > >=`) into two sets. `!=` and
+/// `IS NULL` are ignored — no index accelerates them.
+fn collect_predicates(
+    expr: &CompiledExpr,
+    eq: &mut std::collections::HashSet<String>,
+    range: &mut std::collections::HashSet<String>,
+) {
+    match expr {
+        CompiledExpr::Compare {
+            column_name, op, ..
+        } => match op {
+            CmpOp::Eq => {
+                eq.insert(column_name.clone());
+            }
+            CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => {
+                range.insert(column_name.clone());
+            }
+            CmpOp::Ne => {}
+        },
+        CompiledExpr::IsNull { .. } => {}
+        CompiledExpr::Not(inner) => collect_predicates(inner, eq, range),
+        CompiledExpr::And(a, b) | CompiledExpr::Or(a, b) => {
+            collect_predicates(a, eq, range);
+            collect_predicates(b, eq, range);
+        }
+    }
+}
+
 /// Total order for sorting within one (typed) column: NULLs sort first.
 fn compare_values(a: &Value, b: &Value) -> Ordering {
     match (a, b) {
@@ -3063,6 +3221,56 @@ mod tests {
             db.execute("SELECT dept FROM emp GROUP BY dept HAVING salary > 1")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn index_advisor_recommends_and_respects_existing_indexes() {
+        let dir = ciphra_testutil::tempdir();
+        let mut db = engine(dir.path());
+        db.execute("CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT, total INT)")
+            .unwrap();
+        for i in 0..5 {
+            db.execute(&format!(
+                "INSERT INTO orders VALUES ({i}, {}, {})",
+                i % 3,
+                i * 100
+            ))
+            .unwrap();
+        }
+
+        // Full scans on unindexed columns: equality on customer_id, range
+        // on total. A primary-key lookup must never be advised.
+        for _ in 0..3 {
+            db.execute("SELECT * FROM orders WHERE customer_id = 1")
+                .unwrap();
+        }
+        for _ in 0..2 {
+            db.execute("SELECT * FROM orders WHERE total >= 100")
+                .unwrap();
+        }
+        db.execute("SELECT * FROM orders WHERE id = 2").unwrap();
+
+        let advice = db.advise().unwrap();
+        assert!(advice.iter().any(|a| a.column == "customer_id"
+            && !a.range
+            && a.statement == "CREATE INDEX ON orders (customer_id)"));
+        assert!(advice.iter().any(|a| a.column == "total" && a.range));
+        assert!(!advice.iter().any(|a| a.column == "id")); // PK never advised
+        // Ranked by scan cost: customer_id (3 scans) before total (2).
+        assert_eq!(advice[0].column, "customer_id");
+
+        // Creating the index removes it from the advice; the range one stays.
+        db.execute("CREATE INDEX ON orders (customer_id)").unwrap();
+        db.execute("SELECT * FROM orders WHERE customer_id = 1")
+            .unwrap();
+        let advice = db.advise().unwrap();
+        assert!(!advice.iter().any(|a| a.column == "customer_id" && !a.range));
+        assert!(advice.iter().any(|a| a.column == "total" && a.range));
+
+        // Reset forgets everything.
+        db.advisor_reset();
+        assert!(db.advise().unwrap().is_empty());
+        assert_eq!(db.advisor_query_count(), 0);
     }
 
     #[test]

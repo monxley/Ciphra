@@ -125,6 +125,12 @@ rather than add-ons.
   `TEXT`, stripping backticks and engine/charset clauses, turning
   single-column `KEY`s into indexes, and skipping the rest with notes.
   The imported database is encrypted at rest like any other.
+- **Index advisor**: `.advise` watches this session's queries — which
+  columns are filtered by equality vs range, and how many rows the
+  unindexed ones scan — and suggests the `CREATE INDEX` / `CREATE RANGE
+  INDEX` statements that would help most. The telemetry is in-memory
+  only (it describes *which columns you query*, so it never touches
+  disk).
 - **CLI/REPL** with meta commands (`.tables`, `.schema`, `.audit`,
   `.help`).
 
@@ -176,6 +182,7 @@ ciphra> .audit root             -- print the current audit root to publish
 ciphra> .audit sign             -- ML-DSA-65 signature over the root (post-quantum)
 ciphra> .audit pubkey           -- the audit signing public key (publish once)
 ciphra> .audit prove 2          -- Merkle inclusion proof that entry 2 is in history
+ciphra> .advise                 -- suggest indexes from this session's query patterns
 ciphra> .help                   -- SQL cheatsheet
 ciphra> .exit
 ```

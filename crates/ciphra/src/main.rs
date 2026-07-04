@@ -228,6 +228,7 @@ ENVIRONMENT:
 REPL COMMANDS:
     .tables              List tables
     .schema <table>      Show a table's schema
+    .advise [reset]      Suggest indexes from this session's query patterns
     .audit [root|verify|sign|pubkey|prove <n>]
                          Show/verify the chain, ML-DSA-sign its root, or
                          build a Merkle inclusion proof for entry <n>
@@ -390,6 +391,38 @@ All rows are ChaCha20-Poly1305 encrypted before they reach disk."
             Some(other) => {
                 eprintln!("unknown subcommand: .audit {other} (root|verify|sign|pubkey|prove)")
             }
+        },
+        ".advise" => match parts.next() {
+            Some("reset") => {
+                engine.advisor_reset();
+                println!("index advisor telemetry cleared");
+            }
+            Some(other) => eprintln!("unknown subcommand: .advise {other} (reset)"),
+            None => match engine.advise() {
+                Ok(advice) => {
+                    let seen = engine.advisor_query_count();
+                    if advice.is_empty() {
+                        println!(
+                            "no index suggestions (from {seen} predicate quer{} this session)",
+                            if seen == 1 { "y" } else { "ies" }
+                        );
+                    } else {
+                        println!("suggested indexes (from {seen} queries this session):");
+                        for a in advice {
+                            let why = if a.range {
+                                format!("{} range-scans", a.predicates)
+                            } else {
+                                format!("{} eq-scans", a.predicates)
+                            };
+                            println!(
+                                "  {}   -- {why}, ~{} rows scanned",
+                                a.statement, a.scan_rows
+                            );
+                        }
+                    }
+                }
+                Err(e) => eprintln!("{e}"),
+            },
         },
         ".tables" => match engine.tables() {
             Ok(tables) if tables.is_empty() => println!("(no tables)"),

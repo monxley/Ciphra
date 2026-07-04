@@ -95,7 +95,12 @@ later.
 
 - [ ] Managed cloud offering
 - [ ] NL→SQL assistant (generates SQL, shows it, runs after approval)
-- [ ] AI index advisor over slow-query telemetry
+- [x] Index advisor over query telemetry: `.advise` records which
+      columns each query filters (equality vs range) and how many rows
+      the unindexed ones scan, then suggests the `CREATE INDEX` /
+      `CREATE RANGE INDEX` that would help most. In-memory only (query
+      patterns never touch disk). v1 is heuristic; a learned model can
+      grow on the same telemetry later.
 
 ## Non-goals (v0–v2)
 
