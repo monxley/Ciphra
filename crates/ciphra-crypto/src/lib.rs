@@ -65,6 +65,7 @@ mod poly1305;
 mod rand;
 mod sha256;
 mod x25519;
+mod zeroize;
 
 pub use argon2::argon2id;
 pub use blake2b::{Blake2b, blake2b};
@@ -116,7 +117,14 @@ impl std::error::Error for CryptoError {}
 pub type Result<T> = std::result::Result<T, CryptoError>;
 
 /// Root of the key hierarchy. Derived from a passphrase, never persisted.
+/// Its bytes are zeroized on drop (best-effort; see [`zeroize`]).
 pub struct MasterKey([u8; KEY_LEN]);
+
+impl Drop for MasterKey {
+    fn drop(&mut self) {
+        zeroize::secure_zero(&mut self.0);
+    }
+}
 
 impl MasterKey {
     /// Derive the master key with PBKDF2-HMAC-SHA256.
@@ -187,8 +195,15 @@ impl MasterKey {
     }
 }
 
-/// A ChaCha20-Poly1305 key for one table / purpose.
+/// A ChaCha20-Poly1305 key for one table / purpose. Zeroized on drop
+/// (best-effort; see [`zeroize`]).
 pub struct CipherKey([u8; KEY_LEN]);
+
+impl Drop for CipherKey {
+    fn drop(&mut self) {
+        zeroize::secure_zero(&mut self.0);
+    }
+}
 
 impl CipherKey {
     /// Encrypt `plaintext`, binding it to `aad` (authenticated, not

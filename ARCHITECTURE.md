@@ -271,7 +271,11 @@ NOT protected against (yet — see ROADMAP):
   since format v2 no user-produced plaintext appears on disk.
 - **A compromised host at runtime**: the master key lives in process
   memory while the engine is open. Memory-safety of Rust helps; it is
-  not a defense against root.
+  not a defense against root. Long-lived key holders (`MasterKey`,
+  `CipherKey`, transport secrets) are zeroized on drop, but this is
+  best-effort defense in depth — Rust may still leave copies the
+  compiler spilled or moved, and the passphrase itself is the caller's
+  to manage. It shrinks the window; it is not a defense against root.
 - **Passphrase quality**: Argon2id makes brute force memory-expensive;
   it cannot save a truly weak passphrase.
 - **Side channels beyond cache timing**: no claims yet.
