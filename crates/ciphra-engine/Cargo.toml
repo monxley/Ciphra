@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# Forward the audited crypto backend switch (see ciphra-crypto).
+audited = ["ciphra-crypto/audited", "ciphra-net/audited"]
+
 [dependencies]
 ciphra-storage.workspace = true
 ciphra-crypto.workspace = true

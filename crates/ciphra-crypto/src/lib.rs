@@ -26,6 +26,31 @@
 //! passphrase. It does NOT hide access patterns, key names or object
 //! sizes — see ARCHITECTURE.md for the full model and the planned
 //! upgrades (Argon2id, queryable encryption, audited implementations).
+//!
+//! ## Backends
+//!
+//! This crate is the crypto boundary: everything above it depends only
+//! on the stable public API below, never on a specific implementation.
+//! The default backend is the from-scratch code in this crate. The
+//! `audited` Cargo feature is the opt-in seam for building against
+//! third-party audited implementations of the same primitives — see
+//! [`docs/adr/0004-audited-crypto-backend.md`]. That backend is not
+//! bundled here (its crates cannot be vendored in this environment), so
+//! enabling the feature fails the build with guidance instead of
+//! silently using the from-scratch code.
+
+// Fail closed: `--features audited` must not quietly fall back to the
+// from-scratch backend. See docs/adr/0004-audited-crypto-backend.md.
+#[cfg(feature = "audited")]
+compile_error!(
+    "the `audited` crypto backend is not bundled in this repository. It \
+     replaces Ciphra's from-scratch primitives (SHA-256, HMAC, HKDF, \
+     PBKDF2, ChaCha20-Poly1305, BLAKE2b/Argon2id, SHA-3/SHAKE, X25519, \
+     ML-KEM, ML-DSA) with audited third-party crates. See \
+     docs/adr/0004-audited-crypto-backend.md for the design and the exact \
+     crate mapping. Build with default features to use the from-scratch, \
+     test-vector-verified backend."
+);
 
 mod aead;
 mod argon2;

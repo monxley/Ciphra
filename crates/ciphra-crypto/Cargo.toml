@@ -7,4 +7,17 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# Opt into an externally-provided, *audited* crypto backend instead of
+# the from-scratch primitives. The from-scratch code is the default and
+# is verified against official RFC/NIST/FIPS test vectors; this feature
+# is the seam for swapping in third-party audited implementations once
+# an external audit of ours (or theirs) is the trust anchor.
+#
+# The audited backend is NOT bundled in this repository, so enabling the
+# feature fails the build with guidance rather than silently falling back
+# to the from-scratch code. See docs/adr/0004-audited-crypto-backend.md
+# for the design and the exact crate mapping.
+audited = []
+
 [dependencies]
