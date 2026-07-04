@@ -27,6 +27,12 @@ pub struct ServerIdentity {
     pub public: [u8; 32],
 }
 
+impl Drop for ServerIdentity {
+    fn drop(&mut self) {
+        crate::zeroize::secure_zero(&mut self.secret);
+    }
+}
+
 impl ServerIdentity {
     pub fn generate() -> Self {
         Self::from_secret(random_bytes())
@@ -67,6 +73,15 @@ pub struct ClientState {
     e_public: [u8; 32],
     ek: Vec<u8>,
     dk: Vec<u8>,
+}
+
+impl Drop for ClientState {
+    fn drop(&mut self) {
+        // The ephemeral X25519 secret and the ML-KEM decapsulation key
+        // are the secrets here; the public halves need not be cleared.
+        crate::zeroize::secure_zero(&mut self.e_secret);
+        crate::zeroize::secure_zero(&mut self.dk);
+    }
 }
 
 /// Begin a handshake: returns the state to keep and the hello to send.

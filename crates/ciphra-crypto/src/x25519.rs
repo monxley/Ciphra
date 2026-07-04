@@ -308,8 +308,14 @@ const BASE_POINT: [u8; 32] = {
     b
 };
 
-/// A freshly generated X25519 secret key.
+/// A freshly generated X25519 secret key. Zeroized on drop.
 pub struct SecretKey([u8; 32]);
+
+impl Drop for SecretKey {
+    fn drop(&mut self) {
+        crate::zeroize::secure_zero(&mut self.0);
+    }
+}
 
 impl SecretKey {
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
