@@ -15,7 +15,7 @@ later.
 - [x] REPL + `-e` execution, encrypted-at-rest end-to-end test
 - [x] CI: fmt, clippy, tests
 
-## Phase 1 — A real single-node database
+## Phase 1 — A real single-node database ✅
 
 - [x] `UPDATE`, `AND`/`OR`/`NOT`/`IS NULL` predicates (SQL three-valued
       logic), `ORDER BY`, `LIMIT`/`OFFSET`
@@ -37,7 +37,7 @@ later.
 - [x] Benchmark harness + baseline numbers (docs/BENCHMARKS.md);
       vs-SQLite script included, needs an environment with sqlite3
 
-## Phase 2 — The crypto features that justify the name
+## Phase 2 — The crypto features that justify the name ✅
 
 - [x] Group commit: one fsync + one atomic (all-or-nothing) WAL
       record per statement — 34x on inserts, crash-atomic statements
@@ -59,7 +59,10 @@ later.
       (single self-contained file, audit chain included); `--restore`
       verifies passphrase + chain and refuses to overwrite
 
-## Phase 3 — Multi-node and hardening
+## Phase 3 — Multi-node and hardening ✅
+
+_All code items done; the only open item is an external security audit —
+a 1.0 release blocker, not a code task._
 
 - [x] Wire protocol v1: blind-server storage protocol (ADR-0003),
       `ciphra-server` binary + `--remote` client; plaintext and keys
@@ -95,7 +98,12 @@ later.
 
 - [ ] Managed cloud offering
 - [ ] NL→SQL assistant (generates SQL, shows it, runs after approval)
-- [ ] AI index advisor over slow-query telemetry
+- [x] Index advisor over query telemetry: `.advise` records which
+      columns each query filters (equality vs range) and how many rows
+      the unindexed ones scan, then suggests the `CREATE INDEX` /
+      `CREATE RANGE INDEX` that would help most. In-memory only (query
+      patterns never touch disk). v1 is heuristic; a learned model can
+      grow on the same telemetry later.
 
 ## Non-goals (v0–v2)
 

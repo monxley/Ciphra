@@ -125,6 +125,12 @@ rather than add-ons.
   `TEXT`, stripping backticks and engine/charset clauses, turning
   single-column `KEY`s into indexes, and skipping the rest with notes.
   The imported database is encrypted at rest like any other.
+- **Index advisor**: `.advise` watches this session's queries — which
+  columns are filtered by equality vs range, and how many rows the
+  unindexed ones scan — and suggests the `CREATE INDEX` / `CREATE RANGE
+  INDEX` statements that would help most. The telemetry is in-memory
+  only (it describes *which columns you query*, so it never touches
+  disk).
 - **CLI/REPL** with meta commands (`.tables`, `.schema`, `.audit`,
   `.help`).
 
@@ -176,6 +182,7 @@ ciphra> .audit root             -- print the current audit root to publish
 ciphra> .audit sign             -- ML-DSA-65 signature over the root (post-quantum)
 ciphra> .audit pubkey           -- the audit signing public key (publish once)
 ciphra> .audit prove 2          -- Merkle inclusion proof that entry 2 is in history
+ciphra> .advise                 -- suggest indexes from this session's query patterns
 ciphra> .help                   -- SQL cheatsheet
 ciphra> .exit
 ```
@@ -312,14 +319,22 @@ deliberately does not yet.
 
 ## Roadmap (abridged)
 
-- **Phase 1** ✅ — richer SQL, encrypted table names, primary keys,
-  secondary indexes, Argon2id KDF, key rotation, `EXPLAIN`,
-  benchmark baseline ([docs/BENCHMARKS.md](docs/BENCHMARKS.md)).
-- **Phase 2** — queryable encryption (deterministic/order-revealing
-  layers with an explicit leakage profile), Merkle-tree audit log,
-  vector type + similarity search.
-- **Phase 3** — wire protocol + drivers, replication, post-quantum key
-  exchange (ML-KEM) for the transport, external security audit.
+- **Phase 1** ✅ — richer SQL (aggregates, `GROUP BY`/`HAVING`, `REAL`),
+  encrypted table names, primary keys, secondary indexes, Argon2id KDF,
+  key rotation, `EXPLAIN`, benchmark baseline
+  ([docs/BENCHMARKS.md](docs/BENCHMARKS.md)).
+- **Phase 2** ✅ — queryable encryption with an explicit leakage
+  profile, tamper-evident audit chain with ML-DSA-signed roots and
+  Merkle inclusion proofs, vector type + similarity search,
+  backup/restore.
+- **Phase 3** ✅ — blind-server wire protocol, Python/Go/JS drivers,
+  hybrid post-quantum transport (X25519 + ML-KEM-768), replication,
+  ML-DSA-signed audit roots, an opt-in audited-crypto backend seam
+  (ADR-0004), and light MySQL import. *The one open Phase-3 item is an
+  external security audit — a 1.0 release blocker, not a code task.*
+- **Phase 4** (in progress) — index advisor over query telemetry
+  (`.advise`) is in; NL→SQL assistant and a managed cloud offering are
+  next.
 
 The full plan lives in [ROADMAP.md](ROADMAP.md).
 
