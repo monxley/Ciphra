@@ -134,6 +134,14 @@ the tag check failing.
 What is sealed: every stored value — rows, table schemas (including
 the table name and column names), and row-id sequences.
 
+Nonces are 96-bit random per seal (from the kernel CSPRNG), so a table
+key is safe up to roughly the birthday bound — on the order of 2³² seals
+per key before the collision probability becomes non-negligible. Key
+rotation resets this. Very large single tables that approach that many
+row writes under one key are the case to watch; a per-key seal counter
+(or XChaCha's 192-bit nonce) would remove the bound and is the planned
+hardening if it becomes a practical concern.
+
 ### Table tags
 
 Storage keys cannot contain random nonces (lookups must be repeatable),

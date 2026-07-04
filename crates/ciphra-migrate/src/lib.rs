@@ -179,8 +179,10 @@ fn translate_create_table(stmt: &str, out: &mut Migration) {
         .last()
         .map(unquote_ident)
         .unwrap_or_default();
-    if name_token.is_empty() {
-        out.note("skipped a CREATE TABLE with no table name");
+    if !is_safe_ident(&name_token) {
+        out.note(format!(
+            "skipped CREATE TABLE with an unsafe/unsupported table name: {name_token:?}"
+        ));
         return;
     }
 
@@ -235,6 +237,14 @@ fn translate_create_table(stmt: &str, out: &mut Migration) {
             continue;
         };
         let col_name = unquote_ident(&col_name);
+        if !is_safe_ident(&col_name) {
+            // Refuse the whole table: dropping a column would desync the
+            // column/value counts of its INSERTs.
+            out.note(format!(
+                "skipped table {name_token:?}: unsafe/unsupported column name {col_name:?}"
+            ));
+            return;
+        }
         let (ty, note) = map_type(rest);
         if let Some(n) = note {
             out.note(n);
@@ -341,6 +351,12 @@ fn translate_insert(stmt: &str, out: &mut Migration) {
         return;
     };
     let name = unquote_ident(&name_tok);
+    if !is_safe_ident(&name) {
+        out.note(format!(
+            "skipped INSERT with an unsafe/unsupported table name: {name:?}"
+        ));
+        return;
+    }
 
     // Optional column list before VALUES.
     let Some(values_pos) = find_keyword(rest, "values") else {
@@ -354,6 +370,11 @@ fn translate_insert(stmt: &str, out: &mut Migration) {
         let cols: Vec<String> = paren_columns(head);
         if cols.is_empty() {
             String::new()
+        } else if let Some(bad) = cols.iter().find(|c| !is_safe_ident(c)) {
+            out.note(format!(
+                "skipped INSERT into {name:?}: unsafe/unsupported column name {bad:?}"
+            ));
+            return;
         } else {
             format!(" ({})", cols.join(", "))
         }
@@ -452,6 +473,23 @@ fn decode_mysql_string(tok: &str) -> String {
 /// Quote `s` as a Ciphra string literal (`'…'`, single quotes doubled).
 fn ciphra_string(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Whether `s` is a plain SQL identifier: `[A-Za-z_][A-Za-z0-9_]*`.
+///
+/// The translator emits identifiers into SQL *text* that the engine then
+/// parses (and splits on `;`). A hostile dump could otherwise smuggle
+/// punctuation — `;`, parentheses, quotes — through a backtick-quoted
+/// name and inject statements. Anything that isn't a clean identifier is
+/// refused (the table/INSERT is skipped with a note), so nothing but a
+/// bare identifier ever reaches the output.
+fn is_safe_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Strip surrounding backticks/quotes and any index-prefix length
@@ -681,5 +719,34 @@ UNLOCK TABLES;
         let m = translate("USE mydb; ALTER TABLE t ADD COLUMN x int;");
         assert!(m.statements.is_empty());
         assert_eq!(m.notes.len(), 2);
+    }
+
+    #[test]
+    fn rejects_identifier_injection() {
+        // A hostile dump whose backtick-quoted identifiers carry `;`,
+        // parentheses or spaces must never reach the output as SQL.
+        let dumps = [
+            "INSERT INTO `t;DROP TABLE secrets;--` VALUES (1)",
+            "CREATE TABLE `t;DROP TABLE secrets;--` (`id` int)",
+            "CREATE TABLE ok (`id`); DROP TABLE x;-- ` int)",
+            "INSERT INTO ok (`a`,`b;DROP TABLE x;--`) VALUES (1,2)",
+        ];
+        for dump in dumps {
+            let m = translate(dump);
+            assert!(
+                m.statements
+                    .iter()
+                    .all(|s| !s.contains("DROP") && !s.contains(';')),
+                "injection leaked into output for: {dump}\n  -> {:?}",
+                m.statements
+            );
+        }
+
+        // A clean identifier still works.
+        let m = translate("CREATE TABLE `users` (`id` int PRIMARY KEY)");
+        assert_eq!(
+            m.statements,
+            vec!["CREATE TABLE users (id INT PRIMARY KEY)"]
+        );
     }
 }
