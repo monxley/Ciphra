@@ -81,7 +81,11 @@ later.
       deterministically derived from the passphrase, so a published root
       is verifiable offline by anyone (no passphrase) and unforgeable by
       a quantum adversary
-- [ ] Optional build against audited crypto implementations
+- [~] Optional build against audited crypto implementations: the `audited`
+      Cargo feature (forwarded through every crate) and the fail-closed
+      switch are in place, with the design + crate mapping in ADR-0004;
+      binding the audited crates is deferred until a build environment
+      with registry access (crates.io is blocked here — see ADR-0002)
 - [x] Light MySQL migration: `--import-mysql` translates a `mysqldump`
       file (CREATE TABLE + INSERT, type mapping, single-column indexes)
       into Ciphra and loads it (`ciphra-migrate`)

@@ -134,6 +134,14 @@ the tag check failing.
 What is sealed: every stored value — rows, table schemas (including
 the table name and column names), and row-id sequences.
 
+Nonces are 96-bit random per seal (from the kernel CSPRNG), so a table
+key is safe up to roughly the birthday bound — on the order of 2³² seals
+per key before the collision probability becomes non-negligible. Key
+rotation resets this. Very large single tables that approach that many
+row writes under one key are the case to watch; a per-key seal counter
+(or XChaCha's 192-bit nonce) would remove the bound and is the planned
+hardening if it becomes a practical concern.
+
 ### Table tags
 
 Storage keys cannot contain random nonces (lookups must be repeatable),
@@ -228,9 +236,19 @@ primitives are implemented from the primary specs and verified against
 official test vectors (NIST for SHA-256; RFC 4231, 5869, 7914, 8439).
 ChaCha20 was chosen over AES specifically because a straightforward
 software implementation has no secret-indexed table lookups, i.e. no
-cache-timing side channel. The planned upgrade path is optional builds
-against audited implementations once an external audit of ours exists —
-behind the same `ciphra-crypto` API either way.
+cache-timing side channel.
+
+Because `ciphra-crypto`'s public API is the crypto boundary — every
+layer above it depends only on that API — swapping the *implementation*
+is a localized change. An opt-in `audited` Cargo feature (forwarded by
+every dependent crate) is the seam for building against audited
+third-party crates instead of the from-scratch primitives, behind the
+same API either way. It **fails closed**: enabling it without providing
+the backend is a `compile_error!`, never a silent fallback to unaudited
+code. The design, the exact crate mapping and the implementation recipe
+are in [ADR-0004](docs/adr/0004-audited-crypto-backend.md); the binding
+itself is deferred because this build environment blocks the package
+registry (the same constraint behind ADR-0002).
 
 ## Threat model (v0) — read this honestly
 

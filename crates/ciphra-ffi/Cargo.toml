@@ -12,5 +12,9 @@ name = "ciphra"
 # cdylib for ctypes/bun:ffi (dlopen); staticlib for Go cgo static linking.
 crate-type = ["cdylib", "staticlib"]
 
+[features]
+# Build against the audited crypto backend (see ciphra-crypto).
+audited = ["ciphra-engine/audited"]
+
 [dependencies]
 ciphra-engine.workspace = true

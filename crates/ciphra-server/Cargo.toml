@@ -11,6 +11,10 @@ authors.workspace = true
 name = "ciphra-server"
 path = "src/main.rs"
 
+[features]
+# Build against the audited crypto backend (see ciphra-crypto).
+audited = ["ciphra-net/audited", "ciphra-crypto/audited"]
+
 [dependencies]
 ciphra-net.workspace = true
 ciphra-storage.workspace = true

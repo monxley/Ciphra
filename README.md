@@ -341,6 +341,14 @@ primary specifications and pass official test vectors, but until an
 external audit lands, treat this as a development-grade system. Found
 something? Please open a security advisory rather than a public issue.
 
+For operators whose trust anchor is a specific audited library, an opt-in
+`audited` Cargo feature is the seam for building against audited
+third-party crypto crates instead of the from-scratch primitives, behind
+the same `ciphra-crypto` API. It fails closed (enabling it without
+providing the backend is a build error, never a silent fallback); the
+design and exact crate mapping are in
+[ADR-0004](docs/adr/0004-audited-crypto-backend.md).
+
 ## Support the project
 
 Ciphra is built in the open with no third-party dependencies. If it is
