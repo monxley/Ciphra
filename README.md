@@ -319,14 +319,22 @@ deliberately does not yet.
 
 ## Roadmap (abridged)
 
-- **Phase 1** ✅ — richer SQL, encrypted table names, primary keys,
-  secondary indexes, Argon2id KDF, key rotation, `EXPLAIN`,
-  benchmark baseline ([docs/BENCHMARKS.md](docs/BENCHMARKS.md)).
-- **Phase 2** — queryable encryption (deterministic/order-revealing
-  layers with an explicit leakage profile), Merkle-tree audit log,
-  vector type + similarity search.
-- **Phase 3** — wire protocol + drivers, replication, post-quantum key
-  exchange (ML-KEM) for the transport, external security audit.
+- **Phase 1** ✅ — richer SQL (aggregates, `GROUP BY`/`HAVING`, `REAL`),
+  encrypted table names, primary keys, secondary indexes, Argon2id KDF,
+  key rotation, `EXPLAIN`, benchmark baseline
+  ([docs/BENCHMARKS.md](docs/BENCHMARKS.md)).
+- **Phase 2** ✅ — queryable encryption with an explicit leakage
+  profile, tamper-evident audit chain with ML-DSA-signed roots and
+  Merkle inclusion proofs, vector type + similarity search,
+  backup/restore.
+- **Phase 3** ✅ — blind-server wire protocol, Python/Go/JS drivers,
+  hybrid post-quantum transport (X25519 + ML-KEM-768), replication,
+  ML-DSA-signed audit roots, an opt-in audited-crypto backend seam
+  (ADR-0004), and light MySQL import. *The one open Phase-3 item is an
+  external security audit — a 1.0 release blocker, not a code task.*
+- **Phase 4** (in progress) — index advisor over query telemetry
+  (`.advise`) is in; NL→SQL assistant and a managed cloud offering are
+  next.
 
 The full plan lives in [ROADMAP.md](ROADMAP.md).
 
