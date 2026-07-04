@@ -16,6 +16,7 @@ live in [docs/adr/](docs/adr/).
 | `ciphra-server` | Server binary — stores sealed bytes, holds no keys | net, storage |
 | `ciphra` | CLI / REPL binary | engine |
 | `ciphra-ffi` | C ABI over the engine (`cdylib`/`staticlib`); the core language drivers link against | engine |
+| `ciphra-migrate` | Translate a MySQL (`mysqldump`) file into Ciphra-dialect SQL | — |
 | `ciphra-testutil` | Test-only temp-dir helper | — |
 
 `ciphra-server` deliberately cannot depend on `ciphra-crypto`: the

@@ -1,0 +1,12 @@
+[package]
+name = "ciphra-migrate"
+description = "Translate a MySQL (mysqldump) SQL file into Ciphra-dialect statements"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Pure text-to-text translation: no dependency on the rest of the
+# workspace, and (like everything here) no third-party crates.
+[dependencies]
