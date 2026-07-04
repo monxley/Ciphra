@@ -120,6 +120,11 @@ rather than add-ons.
 - **Sealed backup/restore**: `--backup file` exports one
   self-contained encrypted snapshot (audit chain included);
   `--restore file` verifies the passphrase and the chain before use.
+- **Light MySQL migration**: `ciphra --import-mysql dump.sql` translates
+  a `mysqldump` file into Ciphra — mapping MySQL types to `INT`/`REAL`/
+  `TEXT`, stripping backticks and engine/charset clauses, turning
+  single-column `KEY`s into indexes, and skipping the rest with notes.
+  The imported database is encrypted at rest like any other.
 - **CLI/REPL** with meta commands (`.tables`, `.schema`, `.audit`,
   `.help`).
 
@@ -206,6 +211,24 @@ CIPHRA_PASSPHRASE='old' CIPHRA_NEW_PASSPHRASE='new' \
 # Restore it (verifies the passphrase and the audit chain first):
 ./target/release/ciphra --data ./restored --restore mydb.ciphra
 ```
+
+### Migrate from MySQL
+
+Point Ciphra at a `mysqldump` file to import its schema and data into a
+fresh encrypted database. Unsupported constructs are skipped with notes.
+
+```sh
+mysqldump mydb > dump.sql                       # on the MySQL side
+export CIPHRA_PASSPHRASE='pick a long passphrase'
+./target/release/ciphra --data ./mydb --import-mysql dump.sql
+#   imported from dump.sql: 4 statement(s) applied (1200 row(s)), 0 failed, 2 note(s)
+./target/release/ciphra --data ./mydb -e 'SELECT COUNT(*) FROM employees;'
+```
+
+MySQL types map to `INT` / `REAL` / `TEXT` (`DECIMAL` becomes `REAL`, so
+exact decimal precision is not kept); a single-column `KEY`/`UNIQUE`
+becomes a Ciphra index; `SET`, `LOCK TABLES`, foreign keys, triggers and
+the like are skipped. Review the printed notes after importing.
 
 ### Client / server (blind server)
 

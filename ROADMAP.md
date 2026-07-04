@@ -82,6 +82,9 @@ later.
       is verifiable offline by anyone (no passphrase) and unforgeable by
       a quantum adversary
 - [ ] Optional build against audited crypto implementations
+- [x] Light MySQL migration: `--import-mysql` translates a `mysqldump`
+      file (CREATE TABLE + INSERT, type mapping, single-column indexes)
+      into Ciphra and loads it (`ciphra-migrate`)
 - [ ] External security audit — a release blocker for 1.0
 
 ## Phase 4 — 1.0 and beyond

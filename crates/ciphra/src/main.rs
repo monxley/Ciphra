@@ -28,6 +28,7 @@ fn run() -> Result<ExitCode, String> {
     let mut restore: Option<String> = None;
     let mut remote: Option<String> = None;
     let mut server_key: Option<String> = None;
+    let mut import_mysql: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -50,6 +51,12 @@ fn run() -> Result<ExitCode, String> {
             }
             "--server-key" => {
                 server_key = Some(args.next().ok_or("--server-key requires a hex key")?);
+            }
+            "--import-mysql" => {
+                import_mysql = Some(
+                    args.next()
+                        .ok_or("--import-mysql requires a dump file path")?,
+                );
             }
             "--help" | "-h" => {
                 print_usage();
@@ -137,6 +144,10 @@ run them on the host that owns it"
         return Ok(ExitCode::SUCCESS);
     }
 
+    if let Some(file) = import_mysql {
+        return import_mysql_dump(&mut engine, &file);
+    }
+
     if !execute.is_empty() {
         for sql in &execute {
             run_sql(&mut engine, sql)?;
@@ -145,6 +156,49 @@ run them on the host that owns it"
     }
 
     repl(&mut engine, &data_dir);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Translate a MySQL (`mysqldump`) file to Ciphra SQL and load it into
+/// `engine`. Continues past failing statements, reporting a summary and
+/// any translation notes — the imported database is encrypted like any
+/// other.
+fn import_mysql_dump(engine: &mut Engine, file: &str) -> Result<ExitCode, String> {
+    let dump = std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
+    let migration = ciphra_migrate::translate(&dump);
+
+    let mut applied = 0usize;
+    let mut failed = 0usize;
+    let mut rows = 0usize;
+    for stmt in &migration.statements {
+        match engine.execute(stmt) {
+            Ok(results) => {
+                applied += 1;
+                for result in results {
+                    if let QueryResult::Inserted(n) = result {
+                        rows += n;
+                    }
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                let preview: String = stmt.chars().take(70).collect();
+                eprintln!("import: statement failed ({e}):\n  {preview}…");
+            }
+        }
+    }
+
+    for note in &migration.notes {
+        eprintln!("note: {note}");
+    }
+    println!(
+        "imported from {file}: {applied} statement(s) applied ({rows} row(s)), {failed} failed, \
+         {} note(s)",
+        migration.notes.len()
+    );
+    if failed > 0 {
+        return Ok(ExitCode::FAILURE);
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -163,6 +217,7 @@ OPTIONS:
     --server-key <HEX>   Pin the server's transport key (authenticates it)
     --backup <FILE>      Write a sealed snapshot of the database
     --restore <FILE>     Restore a snapshot into --data (must be empty)
+    --import-mysql <FILE> Load a MySQL (mysqldump) file into the database
     -h, --help           Show this help
     -V, --version        Show version
 

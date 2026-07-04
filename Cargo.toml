@@ -11,6 +11,7 @@ members = [
     "crates/ciphra-net",
     "crates/ciphra-server",
     "crates/ciphra-ffi",
+    "crates/ciphra-migrate",
 ]
 
 [workspace.package]
@@ -29,6 +30,7 @@ ciphra-sql = { path = "crates/ciphra-sql" }
 ciphra-engine = { path = "crates/ciphra-engine" }
 ciphra-testutil = { path = "crates/ciphra-testutil" }
 ciphra-net = { path = "crates/ciphra-net" }
+ciphra-migrate = { path = "crates/ciphra-migrate" }
 
 [profile.release]
 lto = "thin"

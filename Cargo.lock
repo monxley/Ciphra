@@ -7,6 +7,7 @@ name = "ciphra"
 version = "0.0.1"
 dependencies = [
  "ciphra-engine",
+ "ciphra-migrate",
 ]
 
 [[package]]
@@ -38,6 +39,10 @@ version = "0.0.1"
 dependencies = [
  "ciphra-engine",
 ]
+
+[[package]]
+name = "ciphra-migrate"
+version = "0.0.1"
 
 [[package]]
 name = "ciphra-net"
