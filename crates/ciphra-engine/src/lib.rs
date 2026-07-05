@@ -68,49 +68,183 @@ use ciphra_storage::{Batch, Storage, StorageError};
 /// that — per ADR-0003 — never holds keys and cannot decrypt anything
 /// it stores. All reads return owned bytes so both backends share one
 /// engine code path.
-enum Store {
+enum Backend {
     Local(Storage),
     Remote(RemoteStorage),
 }
 
+/// Sealed-byte storage with an optional transaction overlay. When a
+/// transaction is open, writes buffer in `overlay` (`None` = pending
+/// delete, `Some(bytes)` = pending put) and reads see them layered over
+/// the backend — read-your-writes — until `commit_transaction` flushes
+/// them as one atomic batch or `rollback_transaction` drops them. The
+/// engine's read/write call sites are unchanged: the overlay is applied
+/// transparently here.
+struct Store {
+    backend: Backend,
+    overlay: Option<BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
+}
+
 impl Store {
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        match self {
-            Store::Local(s) => Ok(s.get(key).map(<[u8]>::to_vec)),
-            Store::Remote(r) => Ok(r.get(key)?),
+    fn local(storage: Storage) -> Self {
+        Store {
+            backend: Backend::Local(storage),
+            overlay: None,
         }
+    }
+
+    fn remote(remote: RemoteStorage) -> Self {
+        Store {
+            backend: Backend::Remote(remote),
+            overlay: None,
+        }
+    }
+
+    fn in_transaction(&self) -> bool {
+        self.overlay.is_some()
+    }
+
+    /// Open a transaction: subsequent writes buffer instead of hitting
+    /// the backend.
+    fn begin(&mut self) {
+        self.overlay = Some(BTreeMap::new());
+    }
+
+    /// Flush the buffered writes as one atomic backend commit and close
+    /// the transaction.
+    fn commit_transaction(&mut self) -> Result<()> {
+        if let Some(overlay) = self.overlay.take() {
+            let mut batch = Batch::new();
+            for (key, value) in overlay {
+                match value {
+                    Some(v) => batch.put(&key, &v),
+                    None => batch.delete(&key),
+                }
+            }
+            if !batch.is_empty() {
+                self.backend_commit(batch)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop the buffered writes and close the transaction.
+    fn rollback_transaction(&mut self) {
+        self.overlay = None;
+    }
+
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if let Some(overlay) = &self.overlay
+            && let Some(value) = overlay.get(key)
+        {
+            return Ok(value.clone());
+        }
+        self.backend_get(key)
     }
 
     fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        match self {
-            Store::Local(s) => Ok(s
-                .scan_prefix(prefix)
-                .map(|(k, v)| (k.to_vec(), v.to_vec()))
-                .collect()),
-            Store::Remote(r) => Ok(r.scan_prefix(prefix)?),
+        let mut merged: BTreeMap<Vec<u8>, Vec<u8>> =
+            self.backend_scan(prefix)?.into_iter().collect();
+        if let Some(overlay) = &self.overlay {
+            for (key, value) in overlay {
+                if key.starts_with(prefix) {
+                    match value {
+                        Some(v) => {
+                            merged.insert(key.clone(), v.clone());
+                        }
+                        None => {
+                            merged.remove(key);
+                        }
+                    }
+                }
+            }
         }
+        Ok(merged.into_iter().collect())
     }
 
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        match self {
-            Store::Local(s) => s.put(key, value)?,
-            Store::Remote(r) => r.put(key, value)?,
+        if let Some(overlay) = &mut self.overlay {
+            overlay.insert(key.to_vec(), Some(value.to_vec()));
+            return Ok(());
         }
-        Ok(())
+        self.backend_put(key, value)
     }
 
     fn commit(&mut self, batch: Batch) -> Result<()> {
-        match self {
-            Store::Local(s) => s.commit(batch)?,
-            Store::Remote(r) => r.commit(&batch)?,
+        if let Some(overlay) = &mut self.overlay {
+            for (is_delete, key, value) in batch.entries() {
+                overlay.insert(
+                    key.to_vec(),
+                    if is_delete {
+                        None
+                    } else {
+                        Some(value.to_vec())
+                    },
+                );
+            }
+            return Ok(());
+        }
+        self.backend_commit(batch)
+    }
+
+    fn dump(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        // Backups run outside a transaction, but apply any overlay for a
+        // consistent snapshot regardless.
+        let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = self.backend_dump()?.into_iter().collect();
+        if let Some(overlay) = &self.overlay {
+            for (key, value) in overlay {
+                match value {
+                    Some(v) => {
+                        merged.insert(key.clone(), v.clone());
+                    }
+                    None => {
+                        merged.remove(key);
+                    }
+                }
+            }
+        }
+        Ok(merged.into_iter().collect())
+    }
+
+    // -- backend passthroughs (no overlay) --------------------------------
+
+    fn backend_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        match &self.backend {
+            Backend::Local(s) => Ok(s.get(key).map(<[u8]>::to_vec)),
+            Backend::Remote(r) => Ok(r.get(key)?),
+        }
+    }
+
+    fn backend_scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        match &self.backend {
+            Backend::Local(s) => Ok(s
+                .scan_prefix(prefix)
+                .map(|(k, v)| (k.to_vec(), v.to_vec()))
+                .collect()),
+            Backend::Remote(r) => Ok(r.scan_prefix(prefix)?),
+        }
+    }
+
+    fn backend_put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        match &mut self.backend {
+            Backend::Local(s) => s.put(key, value)?,
+            Backend::Remote(r) => r.put(key, value)?,
         }
         Ok(())
     }
 
-    fn dump(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        match self {
-            Store::Local(s) => Ok(s.dump()),
-            Store::Remote(r) => Ok(r.dump()?),
+    fn backend_commit(&mut self, batch: Batch) -> Result<()> {
+        match &mut self.backend {
+            Backend::Local(s) => s.commit(batch)?,
+            Backend::Remote(r) => r.commit(&batch)?,
+        }
+        Ok(())
+    }
+
+    fn backend_dump(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        match &self.backend {
+            Backend::Local(s) => Ok(s.dump()),
+            Backend::Remote(r) => Ok(r.dump()?),
         }
     }
 }
@@ -458,6 +592,12 @@ pub enum QueryResult {
         columns: Vec<String>,
         rows: Vec<Vec<Value>>,
     },
+    /// `BEGIN` opened a transaction.
+    Begin,
+    /// `COMMIT` committed the open transaction.
+    Committed,
+    /// `ROLLBACK` discarded the open transaction.
+    RolledBack,
 }
 
 /// An open Ciphra database.
@@ -468,6 +608,9 @@ pub struct Engine {
     dir: Option<PathBuf>,
     /// Cached audit head: (next sequence number, current chain root).
     audit_head: (u64, [u8; 32]),
+    /// Audit head snapshot taken at `BEGIN`, restored on `ROLLBACK`
+    /// (audit entries advance the cached head as buffered statements run).
+    txn_audit_head: Option<(u64, [u8; 32])>,
     /// In-memory query telemetry for the index advisor. Never persisted:
     /// it describes *which columns are queried*, which is itself
     /// sensitive, so it lives only for the process's lifetime.
@@ -547,7 +690,7 @@ impl Engine {
             let _ = std::fs::remove_dir_all(&leftover);
         }
 
-        let mut store = Store::Local(Storage::open(&dir)?);
+        let mut store = Store::local(Storage::open(&dir)?);
 
         // Databases created before the in-WAL keyparams record migrate
         // from the legacy sidecar file on open (local databases only).
@@ -580,7 +723,7 @@ impl Engine {
         kdf: KdfParams,
     ) -> Result<Self> {
         let remote = RemoteStorage::connect(addr, pinned).map_err(StorageError::Io)?;
-        Self::open_store(Store::Remote(remote), None, passphrase, kdf)
+        Self::open_store(Store::remote(remote), None, passphrase, kdf)
     }
 
     /// Shared tail of every open path: resolve KDF parameters, derive
@@ -637,6 +780,7 @@ impl Engine {
             master,
             dir,
             audit_head,
+            txn_audit_head: None,
             advisor: RefCell::new(Advisor::default()),
         })
     }
@@ -1048,7 +1192,45 @@ impl Engine {
             } => self.update(&table, assignments, predicate),
             Statement::Delete { table, predicate } => self.delete(&table, predicate),
             Statement::Explain(inner) => self.explain(*inner),
+            Statement::Begin => self.begin_transaction(),
+            Statement::Commit => self.commit_transaction(),
+            Statement::Rollback => self.rollback_transaction(),
         }
+    }
+
+    /// Open a transaction: buffer subsequent writes and snapshot the
+    /// audit head so `ROLLBACK` can restore it.
+    fn begin_transaction(&mut self) -> Result<QueryResult> {
+        if self.store.in_transaction() {
+            return Err(EngineError::Schema("a transaction is already open".into()));
+        }
+        self.txn_audit_head = Some(self.audit_head);
+        self.store.begin();
+        Ok(QueryResult::Begin)
+    }
+
+    /// Commit the open transaction: flush its buffered writes as one
+    /// atomic backend commit.
+    fn commit_transaction(&mut self) -> Result<QueryResult> {
+        if !self.store.in_transaction() {
+            return Err(EngineError::Schema("no transaction is open".into()));
+        }
+        self.store.commit_transaction()?;
+        self.txn_audit_head = None;
+        Ok(QueryResult::Committed)
+    }
+
+    /// Roll back the open transaction: drop its buffered writes and
+    /// restore the audit head to where `BEGIN` found it.
+    fn rollback_transaction(&mut self) -> Result<QueryResult> {
+        if !self.store.in_transaction() {
+            return Err(EngineError::Schema("no transaction is open".into()));
+        }
+        self.store.rollback_transaction();
+        if let Some(head) = self.txn_audit_head.take() {
+            self.audit_head = head;
+        }
+        Ok(QueryResult::RolledBack)
     }
 
     /// Describe how a statement would be executed, without running it.
@@ -3271,6 +3453,60 @@ mod tests {
         db.advisor_reset();
         assert!(db.advise().unwrap().is_empty());
         assert_eq!(db.advisor_query_count(), 0);
+    }
+
+    #[test]
+    fn transactions_commit_rollback_and_read_your_writes() {
+        let dir = ciphra_testutil::tempdir();
+        let mut db = engine(dir.path());
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+            .unwrap();
+        let (base_seq, _) = db.audit_root();
+
+        // ROLLBACK discards buffered writes and restores the audit head.
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        // read-your-writes: the uncommitted row is visible inside the txn.
+        assert_eq!(
+            rows_of(db.execute("SELECT v FROM t WHERE id = 1").unwrap()),
+            vec![vec![text("a")]]
+        );
+        db.execute("ROLLBACK").unwrap();
+        assert!(rows_of(db.execute("SELECT * FROM t").unwrap()).is_empty());
+        assert_eq!(db.audit_root().0, base_seq);
+
+        // COMMIT persists atomically; buffered UPDATE applies to a buffered
+        // row; the audit chain advances by the three mutations.
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+            .unwrap();
+        db.execute("UPDATE t SET v = 'A' WHERE id = 1").unwrap();
+        db.execute("COMMIT").unwrap();
+        assert_eq!(
+            rows_of(db.execute("SELECT id, v FROM t").unwrap()),
+            vec![vec![int(1), text("A")], vec![int(2), text("b")]]
+        );
+        assert_eq!(db.audit_root().0, base_seq + 2); // INSERT(2 rows) + UPDATE
+        db.audit_verify().unwrap();
+
+        // Committed data survives a reopen.
+        drop(db);
+        let mut db = engine(dir.path());
+        assert_eq!(rows_of(db.execute("SELECT id FROM t").unwrap()).len(), 2);
+
+        // COMMIT/ROLLBACK without a transaction, and nesting, are errors.
+        assert!(db.execute("COMMIT").is_err());
+        assert!(db.execute("ROLLBACK").is_err());
+        db.execute("BEGIN").unwrap();
+        assert!(db.execute("BEGIN").is_err());
+        db.execute("ROLLBACK").unwrap();
+
+        // Uncommitted work is dropped if the engine closes mid-transaction.
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
+        drop(db);
+        let mut db = engine(dir.path());
+        assert!(rows_of(db.execute("SELECT * FROM t WHERE id = 3").unwrap()).is_empty());
     }
 
     #[test]

@@ -293,6 +293,18 @@ through AND/OR/NOT. Execution is a straight scan-filter-sort-project
 over `scan_prefix` — no planner yet, by design: the planner earns its
 complexity only once secondary indexes exist.
 
+`BEGIN`/`COMMIT`/`ROLLBACK` group statements into one transaction. It is
+a write overlay inside `Store`: while a transaction is open, writes
+buffer in memory (`None` = pending delete, `Some(bytes)` = pending put)
+and every read layers the overlay over the backend, so a transaction
+sees its own uncommitted writes. `COMMIT` flushes the overlay as one
+atomic WAL batch (all-or-nothing across a crash, like a single
+statement); `ROLLBACK` — or closing the engine mid-transaction — drops
+it. The audit head is snapshotted at `BEGIN` and restored on rollback,
+since buffered statements advance the cached head as they run. This is
+local ACID only; cross-node distributed commit is a non-goal (the model
+is single-writer log shipping).
+
 Vector columns hold fixed-dimension f32 embeddings written as
 `[0.1, -2, 0.5]` literals. They have no order: comparisons, plain
 `ORDER BY` and all index kinds are rejected with a pointed error;

@@ -59,6 +59,23 @@ impl Parser {
                     )),
                 }
             }
+            "begin" => {
+                // Optional noise word: BEGIN [TRANSACTION|WORK].
+                let _ = self.eat_keyword("transaction") || self.eat_keyword("work");
+                Ok(Statement::Begin)
+            }
+            "start" => {
+                self.expect_keyword("transaction")?;
+                Ok(Statement::Begin)
+            }
+            "commit" => {
+                let _ = self.eat_keyword("transaction") || self.eat_keyword("work");
+                Ok(Statement::Commit)
+            }
+            "rollback" => {
+                let _ = self.eat_keyword("transaction") || self.eat_keyword("work");
+                Ok(Statement::Rollback)
+            }
             other => Err(ParseError(format!("unknown statement: {other:?}"))),
         }
     }

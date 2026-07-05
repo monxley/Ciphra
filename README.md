@@ -50,6 +50,10 @@ rather than add-ons.
   `HAVING`; typed columns (`INT`, `REAL`, `TEXT`). Aggregates run in the
   engine over decrypted rows, so they carry the same leakage profile as
   a plain `SELECT`.
+- **Transactions** (`BEGIN` / `COMMIT` / `ROLLBACK`): group many
+  statements into one atomic commit. Buffered writes are read-your-writes
+  inside the transaction, then flushed as a single WAL batch on `COMMIT`
+  (so a crash leaves all-or-nothing) or discarded on `ROLLBACK`.
 - **`PRIMARY KEY`** with uniqueness and non-NULL enforcement, backed by
   an encrypted equality index: `WHERE pk = x` is a point lookup, not a
   scan — and the index stores only keyed tags of values, never values.
@@ -175,6 +179,9 @@ ciphra> INSERT INTO users VALUES (1, 'alice', '111-22-3333');
 ciphra> SELECT name, ssn FROM users WHERE id = 1;
 ciphra> SELECT count(*), max(id) FROM users;          -- aggregates
 ciphra> SELECT name, count(*) FROM users GROUP BY name;
+ciphra> BEGIN;                                        -- one atomic transaction
+ciphra> UPDATE users SET name = 'robert' WHERE id = 2;
+ciphra> COMMIT;                                       -- or ROLLBACK to discard
 ciphra> .tables                 -- list tables
 ciphra> .schema users           -- show a table's columns
 ciphra> .audit verify           -- re-check the whole tamper-evident chain
