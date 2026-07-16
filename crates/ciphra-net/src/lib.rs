@@ -523,6 +523,14 @@ impl RemoteStorage {
     pub fn connect(addr: impl ToSocketAddrs, pinned: Option<[u8; 32]>) -> std::io::Result<Self> {
         let mut stream = TcpStream::connect(addr)?;
         stream.set_nodelay(true)?;
+        // Bound every read/write. Without this a half-open connection — the
+        // mobile-NAT case, where the peer's mapping is dropped with no RST — makes
+        // a blocking read wait forever, silently wedging a client that polls this
+        // connection (e.g. a messenger's mailbox reader). A timeout turns the wedge
+        // into a recoverable error the caller can reconnect on.
+        let t = Some(std::time::Duration::from_secs(20));
+        stream.set_read_timeout(t)?;
+        stream.set_write_timeout(t)?;
         let (channel, server_public, authenticated) = client_handshake(&mut stream, pinned)?;
         Ok(RemoteStorage {
             stream: RefCell::new(stream),
