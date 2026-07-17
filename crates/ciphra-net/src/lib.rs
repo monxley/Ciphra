@@ -27,6 +27,8 @@ use ciphra_crypto::{
 };
 use ciphra_storage::{Batch, Storage, StorageError};
 
+pub mod socks5;
+
 const OP_GET: u8 = 1;
 const OP_SCAN: u8 = 2;
 const OP_COMMIT: u8 = 3;
@@ -336,7 +338,7 @@ pub fn follow(
     shared: SharedStorage,
     mut on_event: impl FnMut(FollowEvent),
 ) -> std::io::Result<()> {
-    let mut stream = TcpStream::connect(addr)?;
+    let mut stream = socks5::dial(addr)?;
     stream.set_nodelay(true)?;
     let (mut channel, server_public, authenticated) = client_handshake(&mut stream, pinned)?;
     on_event(FollowEvent::Connected {
@@ -521,7 +523,7 @@ impl RemoteStorage {
     /// server's key is trusted on first use — encrypted and
     /// post-quantum, but open to a man-in-the-middle.
     pub fn connect(addr: impl ToSocketAddrs, pinned: Option<[u8; 32]>) -> std::io::Result<Self> {
-        let mut stream = TcpStream::connect(addr)?;
+        let mut stream = socks5::dial(addr)?;
         stream.set_nodelay(true)?;
         // Bound every read/write. Without this a half-open connection — the
         // mobile-NAT case, where the peer's mapping is dropped with no RST — makes
